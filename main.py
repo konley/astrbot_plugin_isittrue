@@ -19,7 +19,7 @@ from data.plugins.astrbot_plugin_anysearch.client import AnySearchClient, AnySea
     "astrbot_plugin_isittrue",
     "you",
     "是真的吗——群聊事实核查小工具。@机器人说出你想核实的事情，或引用一条消息，AI 自动判断真假。无需额外 API，即装即用。",
-    "1.0.0",
+    "1.1.0",
 )
 class IsItTrue(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -137,8 +137,9 @@ class IsItTrue(Star):
             content = (llm_resp.completion_text or "").strip()
             logger.info(f"[是真的吗] 模型返回：{content[:200]!r}")
         except Exception as e:  # noqa: BLE001
-            logger.error(f"[是真的吗] 调用大模型失败: {e}")
-            yield event.plain_result("判断失败，请稍后重试。")
+            err_msg = str(e)
+            logger.error(f"[是真的吗] 调用大模型失败: {err_msg}")
+            yield event.plain_result(self._friendly_error(err_msg))
             return
 
         if not content:
@@ -253,6 +254,20 @@ class IsItTrue(Star):
             return ""
 
     # ---------- 辅助方法 ----------
+
+    @staticmethod
+    def _friendly_error(err_msg: str) -> str:
+        """根据 LLM 返回的错误信息，给出用户可理解的提示。"""
+        msg = err_msg.lower()
+        if "sensitive" in msg or "content_filter" in msg or "1026" in msg:
+            return "图片内容被AI服务商安全审核拦截，无法判断，请更换图片后重试。"
+        if "rate_limit" in msg or "429" in msg or "quota" in msg:
+            return "AI服务当前繁忙，请稍后重试。"
+        if "timeout" in msg or "timed out" in msg:
+            return "判断超时，请稍后重试。"
+        if "context_length" in msg or "too long" in msg or "maximum context" in msg:
+            return "内容过长，超出AI处理限制，请精简后重试。"
+        return "判断失败，请稍后重试。"
 
     DEFAULT_TRIGGER_PHRASES = ("真的吗",)
 
