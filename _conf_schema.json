@@ -5,17 +5,34 @@
     "hint": "同一用户在该时间内重复触发会被拦截",
     "default": 10
   },
+  "trigger_phrases": {
+    "description": "检测触发词列表",
+    "type": "list",
+    "hint": "每行一个触发词。@机器人或引用消息时，文本包含任一触发词就会触发；开启前缀/结尾监听后，也会使用这里的词进行匹配。留空会回退为“真的吗”。",
+    "default": [
+      "真的吗"
+    ],
+    "items": {
+      "type": "string"
+    }
+  },
   "listen_suffix": {
-    "description": "监听\"真的吗/真的吗？\"结尾的消息",
+    "description": "监听触发词结尾的消息",
     "type": "bool",
-    "hint": "开启后，群内以\"真的吗\"或\"真的吗？\"结尾的消息会自动触发判断（无需@）",
+    "hint": "开启后，群内以任一检测触发词结尾的消息会自动触发判断（无需@），同时兼容中文/英文问号结尾",
     "default": false
   },
   "listen_prefix": {
-    "description": "监听\"真的吗\"开头的消息",
+    "description": "监听触发词开头的消息",
     "type": "bool",
-    "hint": "开启后，群内以\"真的吗\"开头的消息会自动触发判断（无需@）",
+    "hint": "开启后，群内以任一检测触发词开头的消息会自动触发判断（无需@）",
     "default": false
+  },
+  "provider_id": {
+    "description": "事实核查模型 Provider ID",
+    "type": "string",
+    "hint": "默认使用已配置的 openai/gpt-5.5；如果该 Provider 不存在会回退到当前默认模型",
+    "default": "openai/gpt-5.5"
   },
   "enable_vision": {
     "description": "是否启用图片分析",
@@ -26,7 +43,7 @@
   "enable_web_search": {
     "description": "启用联网搜索增强",
     "type": "bool",
-    "hint": "依赖 astrbot_plugin_MiniMax_CLI 的 mmx search。开启后先联网检索再交给模型核查；若 mmx 不可用会自动回退到仅凭模型知识判断",
+    "hint": "依赖 astrbot_plugin_anysearch。开启后先用 Anysearch 联网检索再交给模型核查；若 Anysearch 不可用会自动回退到仅凭模型知识判断",
     "default": false
   },
   "search_timeout": {
@@ -34,12 +51,6 @@
     "type": "int",
     "hint": "超时后自动回退兜底",
     "default": 30
-  },
-  "group_blacklist": {
-    "description": "黑名单群 ID 列表",
-    "type": "list",
-    "default": [],
-    "hint": "在此列表中的群聊，插件将不触发事实核查。填入纯数字群号即可。"
   },
   "system_prompt": {
     "description": "事实核查系统提示词",
