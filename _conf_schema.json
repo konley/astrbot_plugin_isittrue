@@ -43,7 +43,7 @@
   "enable_web_search": {
     "description": "启用联网搜索增强",
     "type": "bool",
-    "hint": "依赖 astrbot_plugin_anysearch。开启后先用 Anysearch 联网检索再交给模型核查；若 Anysearch 不可用会自动回退到仅凭模型知识判断",
+    "hint": "可选依赖 astrbot_plugin_anysearch（未安装也不影响本插件加载）。开启后先用 Anysearch 联网检索再交给模型核查；若 Anysearch 不可用会自动回退到仅凭模型知识判断",
     "default": false
   },
   "search_timeout": {

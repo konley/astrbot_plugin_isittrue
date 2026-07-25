@@ -95,6 +95,10 @@ astrbot_plugin_isittrue/
 
 ## 更新日志
 
+### v1.1.1
+
+- **fix**: 安装/加载不再硬依赖 `astrbot_plugin_anysearch`。未安装时插件可正常启用；仅在开启联网搜索时再懒加载 Anysearch，失败则自动回退到模型判断
+
 ### v1.1.0
 
 - **feat**: 联网搜索增强 — 支持通过 `astrbot_plugin_anysearch` 联网检索后再核查，时效性内容判断更准确

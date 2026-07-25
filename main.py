@@ -12,14 +12,13 @@ from astrbot.core.utils.quoted_message_parser import (
     extract_quoted_message_images,
     extract_quoted_message_text,
 )
-from data.plugins.astrbot_plugin_anysearch.client import AnySearchClient, AnySearchError
 
 
 @register(
     "astrbot_plugin_isittrue",
-    "you",
+    "konley",
     "是真的吗——群聊事实核查小工具。@机器人说出你想核实的事情，或引用一条消息，AI 自动判断真假。无需额外 API，即装即用。",
-    "1.1.0",
+    "1.1.1",
 )
 class IsItTrue(Star):
     def __init__(self, context: Context, config: dict | None = None):
@@ -212,6 +211,9 @@ class IsItTrue(Star):
     ) -> str:
         """Search the web through Anysearch and return prompt-ready references.
 
+        Anysearch is optional. This plugin must still load when
+        astrbot_plugin_anysearch is not installed.
+
         Args:
             query: Search query extracted from text or images.
             event: Optional source event passed to the registered LLM tool.
@@ -219,6 +221,7 @@ class IsItTrue(Star):
         Returns:
             Search text limited for prompt injection, or an empty string on failure.
         """
+        error_cls: type[Exception] = Exception
         try:
             tool_manager = getattr(self.context, "get_llm_tool_manager", lambda: None)()
             tool = tool_manager.get_func("anysearch_search") if tool_manager else None
@@ -230,28 +233,106 @@ class IsItTrue(Star):
                 )
                 return str(result or "").strip()[:2000]
 
-            config_path = (
-                Path(get_astrbot_data_path())
-                / "config"
-                / "astrbot_plugin_anysearch_config.json"
-            )
-            api_key = ""
-            if config_path.exists():
-                data = json.loads(config_path.read_text(encoding="utf-8-sig"))
-                api_key = str(data.get("api_key", ""))
+            client_cls, error_cls = self._load_anysearch_client()
+            if client_cls is None:
+                logger.warning(
+                    "[是真的吗] 已开启联网搜索，但未找到 astrbot_plugin_anysearch；"
+                    "请先安装并启用该插件，或关闭 enable_web_search"
+                )
+                return ""
+
+            api_key = self._read_anysearch_api_key()
             logger.info("[是真的吗] 使用 Anysearch client 执行联网搜索")
-            client = AnySearchClient(api_key=api_key, timeout=self.search_timeout)
+            client = client_cls(api_key=api_key, timeout=self.search_timeout)
             result = await client.search(query, max_results=5)
             return str(result or "").strip()[:2000]
-        except AnySearchError as e:
-            logger.warning(f"[是真的吗] Anysearch 联网搜索失败，回退兜底：{e}")
-            return ""
         except TimeoutError as e:
             logger.warning(f"[是真的吗] Anysearch 联网搜索超时，回退兜底：{e}")
             return ""
         except Exception as e:  # noqa: BLE001
+            if error_cls is not Exception and isinstance(e, error_cls):
+                logger.warning(f"[是真的吗] Anysearch 联网搜索失败，回退兜底：{e}")
+                return ""
             logger.warning(f"[是真的吗] Anysearch 联网搜索异常，回退兜底：{e}")
             return ""
+
+    @staticmethod
+    def _read_anysearch_api_key() -> str:
+        """Read optional api_key from astrbot_plugin_anysearch config."""
+        config_path = (
+            Path(get_astrbot_data_path())
+            / "config"
+            / "astrbot_plugin_anysearch_config.json"
+        )
+        if not config_path.exists():
+            return ""
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+            return str(data.get("api_key", "") or "")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[是真的吗] 读取 Anysearch 配置失败：{e}")
+            return ""
+
+    @staticmethod
+    def _load_anysearch_client() -> tuple[type | None, type[Exception]]:
+        """Lazy-import Anysearch client without hard dependency at module import.
+
+        Returns:
+            (AnySearchClient class or None, exception type for search failures)
+        """
+        import importlib
+        import importlib.util
+        import sys
+
+        module_candidates = (
+            "data.plugins.astrbot_plugin_anysearch.client",
+            "data.addons.plugins.astrbot_plugin_anysearch.client",
+        )
+        for module_name in module_candidates:
+            try:
+                module = importlib.import_module(module_name)
+                client_cls = getattr(module, "AnySearchClient", None)
+                error_cls = getattr(module, "AnySearchError", Exception)
+                if client_cls is not None:
+                    return (
+                        client_cls,
+                        error_cls if isinstance(error_cls, type) else Exception,
+                    )
+            except Exception:
+                continue
+
+        try:
+            data_path = Path(get_astrbot_data_path())
+        except Exception:
+            return None, Exception
+
+        file_candidates = (
+            data_path / "plugins" / "astrbot_plugin_anysearch" / "client.py",
+            data_path / "addons" / "plugins" / "astrbot_plugin_anysearch" / "client.py",
+        )
+        for client_path in file_candidates:
+            if not client_path.is_file():
+                continue
+            module_name = f"_isittrue_anysearch_client_{abs(hash(str(client_path)))}"
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, client_path)
+                if spec is None or spec.loader is None:
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+                client_cls = getattr(module, "AnySearchClient", None)
+                error_cls = getattr(module, "AnySearchError", Exception)
+                if client_cls is not None:
+                    return (
+                        client_cls,
+                        error_cls if isinstance(error_cls, type) else Exception,
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[是真的吗] 动态加载 Anysearch client 失败：{client_path} | {e}"
+                )
+        return None, Exception
 
     # ---------- 辅助方法 ----------
 
