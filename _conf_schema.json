@@ -9,8 +9,12 @@
     "description": "检测触发词列表",
     "type": "list",
     "hint": "每行一个触发词。@机器人或引用消息时，文本命中任一触发词就会触发；开启前缀/结尾监听后也会用这些词匹配。留空回退为“真的吗”。英文词会按边界匹配，避免误伤。",
-    "default": ["真的吗"],
-    "items": { "type": "string" }
+    "default": [
+      "真的吗"
+    ],
+    "items": {
+      "type": "string"
+    }
   },
   "listen_suffix": {
     "description": "监听触发词结尾的消息",
@@ -29,7 +33,9 @@
     "type": "list",
     "hint": "填群号。黑名单内的群不会触发本插件",
     "default": [],
-    "items": { "type": "string" }
+    "items": {
+      "type": "string"
+    }
   },
   "provider_id": {
     "description": "事实核查模型 Provider ID",
@@ -89,5 +95,29 @@
     "description": "事实核查系统提示词",
     "type": "text",
     "default": "你是群聊事实核查助手。你只能依据用户提供的「待核内容」「图片」和「参考资料」作答，不要假装自己刚刚联网搜索，也不要编造不存在的链接或新闻。\n判断原则：\n1. 只核查可验证的事实主张；主观观点、价值判断、玩笑、预测优先 unknown。\n2. 若内容含多条主张，只核查最核心、最可验证的一条，并在解释中点明。\n3. 涉及时效信息（股价、比分、突发新闻、最新政策等）且没有可用参考资料时，优先 unknown，不要用过期记忆硬判。\n4. 图片仅在可辨认关键文字/图表时作为证据；看不清就说明限制。\n5. 必须严格按以下格式输出，第一行只能是单个英文单词：\n第一行：true / false / unknown\n第二行起：中文解释，100字以内，说明依据与不确定点。"
+  },
+  "max_forward_depth": {
+    "description": "合并转发最大嵌套层数",
+    "type": "int",
+    "hint": "超过后截断并在备注说明。硬上限 8，默认 4，防恶意深层嵌套",
+    "default": 4
+  },
+  "max_forward_nodes": {
+    "description": "合并转发最大节点数",
+    "type": "int",
+    "hint": "统计展开过程中的消息节点。硬上限 100，默认 40",
+    "default": 40
+  },
+  "max_forward_fetch": {
+    "description": "合并转发远程展开最大次数",
+    "type": "int",
+    "hint": "调用 get_forward_msg 的次数上限，含嵌套。硬上限 20，默认 8；重复 id 会跳过",
+    "default": 8
+  },
+  "max_forward_images": {
+    "description": "合并转发最多提取图片数",
+    "type": "int",
+    "hint": "防止超多图打满多模态请求。硬上限 20，默认 8",
+    "default": 8
   }
 }

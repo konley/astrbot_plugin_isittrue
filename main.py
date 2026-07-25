@@ -34,6 +34,125 @@ DEFAULT_SYSTEM_PROMPT = (
     "第二行起：中文解释，100字以内，说明依据与不确定点。"
 )
 
+# 合并转发展开硬上限，防恶意深层嵌套 / 环
+DEFAULT_MAX_FORWARD_DEPTH = 4
+DEFAULT_MAX_FORWARD_NODES = 40
+DEFAULT_MAX_FORWARD_FETCH = 8
+DEFAULT_MAX_FORWARD_IMAGES = 8
+
+
+class _ForwardBudget:
+    """Shared expansion budget for nested forward/Nodes trees."""
+
+    __slots__ = (
+        "max_depth",
+        "max_nodes",
+        "max_fetch",
+        "max_images",
+        "max_chars",
+        "nodes",
+        "fetches",
+        "images",
+        "chars",
+        "seen_forward_ids",
+        "notes",
+        "truncated",
+    )
+
+    def __init__(
+        self,
+        *,
+        max_depth: int,
+        max_nodes: int,
+        max_fetch: int,
+        max_images: int,
+        max_chars: int,
+    ) -> None:
+        self.max_depth = max(1, int(max_depth))
+        self.max_nodes = max(1, int(max_nodes))
+        self.max_fetch = max(1, int(max_fetch))
+        self.max_images = max(1, int(max_images))
+        self.max_chars = max(200, int(max_chars))
+        self.nodes = 0
+        self.fetches = 0
+        self.images = 0
+        self.chars = 0
+        self.seen_forward_ids: set[str] = set()
+        self.notes: list[str] = []
+        self.truncated = False
+
+    def note(self, msg: str) -> None:
+        if msg and msg not in self.notes:
+            self.notes.append(msg)
+
+    def stop(self, reason: str) -> None:
+        self.truncated = True
+        self.note(reason)
+
+    def allow_depth(self, depth: int) -> bool:
+        if self.truncated:
+            return False
+        if depth > self.max_depth:
+            self.stop(f"合并转发嵌套超过 {self.max_depth} 层，已截断。")
+            return False
+        return True
+
+    def allow_node(self) -> bool:
+        if self.truncated:
+            return False
+        if self.nodes >= self.max_nodes:
+            self.stop(f"合并转发节点超过 {self.max_nodes} 条，已截断。")
+            return False
+        self.nodes += 1
+        return True
+
+    def allow_fetch(self, forward_id: str) -> bool:
+        if self.truncated:
+            return False
+        fid = (forward_id or "").strip()
+        if not fid:
+            return False
+        if fid in self.seen_forward_ids:
+            self.note("检测到重复/循环的合并转发 id，已跳过。")
+            return False
+        if self.fetches >= self.max_fetch:
+            self.stop(f"合并转发远程展开超过 {self.max_fetch} 次，已截断。")
+            return False
+        self.seen_forward_ids.add(fid)
+        self.fetches += 1
+        return True
+
+    def take_images(self, urls: list[str]) -> list[str]:
+        kept: list[str] = []
+        for url in urls:
+            if self.images >= self.max_images:
+                self.note(f"合并转发图片超过 {self.max_images} 张，已截断。")
+                break
+            if not url or url in kept:
+                continue
+            kept.append(url)
+            self.images += 1
+        return kept
+
+    def take_text(self, text: str) -> str:
+        text = (text or "").strip()
+        if not text:
+            return ""
+        if self.chars >= self.max_chars:
+            self.note(f"合并转发文本超过 {self.max_chars} 字，已截断。")
+            return ""
+        remain = self.max_chars - self.chars
+        if len(text) > remain:
+            text = text[: max(0, remain - 12)].rstrip() + "\n…(已截断)"
+            self.chars = self.max_chars
+            self.note(f"合并转发文本超过 {self.max_chars} 字，已截断。")
+            return text
+        self.chars += len(text)
+        return text
+
+    def summary_note(self) -> str:
+        return "；".join(self.notes)
+
 
 class _InlineAnySearchClient:
     """Minimal Anysearch HTTP client. No hard dependency on other plugins."""
@@ -104,7 +223,7 @@ class _InlineAnySearchClient:
     "astrbot_plugin_isittrue",
     "konley",
     "是真的吗——群聊事实核查小工具。@机器人说出你想核实的事情，或引用一条消息，AI 自动判断真假。无需额外 API，即装即用。",
-    "1.2.0",
+    "1.2.1",
     "https://github.com/konley/astrbot_plugin_isittrue",
 )
 class IsItTrue(Star):
@@ -130,6 +249,19 @@ class IsItTrue(Star):
         self.max_search_chars: int = max(
             200, int(config.get("max_search_chars", 2000) or 2000)
         )
+        # 合并转发兜底：深度/节点/远程拉取/图片，全部硬夹紧
+        self.max_forward_depth: int = min(
+            8, max(1, int(config.get("max_forward_depth", DEFAULT_MAX_FORWARD_DEPTH) or DEFAULT_MAX_FORWARD_DEPTH))
+        )
+        self.max_forward_nodes: int = min(
+            100, max(1, int(config.get("max_forward_nodes", DEFAULT_MAX_FORWARD_NODES) or DEFAULT_MAX_FORWARD_NODES))
+        )
+        self.max_forward_fetch: int = min(
+            20, max(1, int(config.get("max_forward_fetch", DEFAULT_MAX_FORWARD_FETCH) or DEFAULT_MAX_FORWARD_FETCH))
+        )
+        self.max_forward_images: int = min(
+            20, max(1, int(config.get("max_forward_images", DEFAULT_MAX_FORWARD_IMAGES) or DEFAULT_MAX_FORWARD_IMAGES))
+        )
         self.true_label: str = (
             str(config.get("true_label", DEFAULT_TRUE_LABEL) or DEFAULT_TRUE_LABEL).strip()
             or DEFAULT_TRUE_LABEL
@@ -151,7 +283,7 @@ class IsItTrue(Star):
 
     async def initialize(self) -> None:
         logger.info(
-            f"{LOG_PREFIX} 插件已加载 v1.2.0 | triggers={list(self.trigger_phrases)} "
+            f"{LOG_PREFIX} 插件已加载 v1.2.1 | triggers={list(self.trigger_phrases)} "
             f"web_search={self.enable_web_search} vision={self.enable_vision} "
             f"blacklist={len(self.group_blacklist)}"
         )
@@ -703,21 +835,32 @@ class IsItTrue(Star):
             "supplement": "",
             "image_note": "",
         }
+    def _new_forward_budget(self) -> _ForwardBudget:
+        return _ForwardBudget(
+            max_depth=self.max_forward_depth,
+            max_nodes=self.max_forward_nodes,
+            max_fetch=self.max_forward_fetch,
+            max_images=self.max_forward_images,
+            max_chars=self.max_content_chars,
+        )
+
     async def _extract_forward_from_chain(
         self, event: AstrMessageEvent, chain: list
     ) -> tuple[str, list[str], str]:
+        budget = self._new_forward_budget()
         texts: list[str] = []
         images: list[str] = []
-        note = ""
 
         for comp in chain:
+            if budget.truncated:
+                break
             if isinstance(comp, Nodes):
-                t, imgs = self._parse_nodes(comp)
+                t, imgs = self._parse_nodes(comp, budget=budget, depth=1)
                 if t:
                     texts.append(t)
                 images.extend(imgs)
             elif isinstance(comp, Node):
-                t, imgs = self._parse_node(comp)
+                t, imgs = self._parse_node(comp, budget=budget, depth=1)
                 if t:
                     texts.append(t)
                 images.extend(imgs)
@@ -725,23 +868,42 @@ class IsItTrue(Star):
                 fid = str(getattr(comp, "id", "") or "").strip()
                 if not fid:
                     continue
-                t, imgs, n = await self._fetch_forward_by_id(event, fid)
+                t, imgs = await self._fetch_forward_by_id(
+                    event, fid, budget=budget, depth=1
+                )
                 if t:
                     texts.append(t)
                 images.extend(imgs)
-                if n:
-                    note = n
 
+        note = budget.summary_note()
+        if budget.truncated:
+            logger.warning(
+                f"{LOG_PREFIX} 合并转发展开被截断 | nodes={budget.nodes}/{budget.max_nodes} "
+                f"fetch={budget.fetches}/{budget.max_fetch} images={budget.images}/{budget.max_images} "
+                f"note={note!r}"
+            )
         return "\n".join(texts).strip(), list(dict.fromkeys(images)), note
 
     async def _fetch_forward_by_id(
-        self, event: AstrMessageEvent, forward_id: str
-    ) -> tuple[str, list[str], str]:
-        """Best-effort OneBot get_forward_msg for bare Forward components."""
+        self,
+        event: AstrMessageEvent,
+        forward_id: str,
+        *,
+        budget: _ForwardBudget | None = None,
+        depth: int = 1,
+    ) -> tuple[str, list[str]]:
+        """Best-effort OneBot get_forward_msg with nest/cycle budget."""
+        budget = budget or self._new_forward_budget()
+        if not budget.allow_depth(depth):
+            return "", []
+        if not budget.allow_fetch(forward_id):
+            return "", []
+
         try:
             client = getattr(event, "bot", None)
             if client is None:
-                return "", [], "合并转发未能展开（无可用 OneBot 客户端）。"
+                budget.note("合并转发未能展开（无可用 OneBot 客户端）。")
+                return "", []
 
             result = None
             api = getattr(client, "api", client)
@@ -761,7 +923,8 @@ class IsItTrue(Star):
             if result is None and hasattr(client, "call_action"):
                 result = await client.call_action("get_forward_msg", id=forward_id)
             if not result:
-                return "", [], "合并转发展开失败。"
+                budget.note("合并转发展开失败。")
+                return "", []
 
             payload = result
             if isinstance(result, dict) and "data" in result:
@@ -775,48 +938,92 @@ class IsItTrue(Star):
             images: list[str] = []
             if isinstance(messages, list):
                 for msg in messages:
+                    if budget.truncated:
+                        break
                     if not isinstance(msg, dict):
                         continue
+                    if not budget.allow_node():
+                        break
                     sender = msg.get("sender") or {}
                     name = ""
                     if isinstance(sender, dict):
                         name = str(sender.get("nickname") or sender.get("card") or "")
                     content = msg.get("content") or msg.get("message") or []
-                    t, imgs = self._parse_onebot_content(content)
+                    t, imgs = await self._parse_onebot_content(
+                        event, content, budget=budget, depth=depth
+                    )
+                    t = budget.take_text(t)
+                    imgs = budget.take_images(imgs)
                     if t:
                         text_parts.append(f"{name}: {t}" if name else t)
                     images.extend(imgs)
-            return "\n".join(text_parts).strip(), list(dict.fromkeys(images)), ""
+            return "\n".join(text_parts).strip(), list(dict.fromkeys(images))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"{LOG_PREFIX} get_forward_msg 失败：{e}")
-            return "", [], f"合并转发展开失败：{e}"
+            budget.note(f"合并转发展开失败：{e}")
+            return "", []
 
-    def _parse_nodes(self, nodes: Nodes) -> tuple[str, list[str]]:
+    def _parse_nodes(
+        self,
+        nodes: Nodes,
+        *,
+        budget: _ForwardBudget | None = None,
+        depth: int = 1,
+    ) -> tuple[str, list[str]]:
+        budget = budget or self._new_forward_budget()
+        if not budget.allow_depth(depth):
+            return "", []
         parts: list[str] = []
         images: list[str] = []
         for node in getattr(nodes, "nodes", []) or []:
-            t, imgs = self._parse_node(node)
+            if budget.truncated:
+                break
+            t, imgs = self._parse_node(node, budget=budget, depth=depth)
             if t:
                 parts.append(t)
             images.extend(imgs)
         return "\n".join(parts).strip(), images
 
-    def _parse_node(self, node: Node) -> tuple[str, list[str]]:
+    def _parse_node(
+        self,
+        node: Node,
+        *,
+        budget: _ForwardBudget | None = None,
+        depth: int = 1,
+    ) -> tuple[str, list[str]]:
+        budget = budget or self._new_forward_budget()
+        if not budget.allow_depth(depth):
+            return "", []
+        if not budget.allow_node():
+            return "", []
         name = str(getattr(node, "name", "") or "").strip()
         content = getattr(node, "content", None) or []
-        text, images = self._parse_chain(content)
+        text, images = self._parse_chain(content, budget=budget, depth=depth)
+        text = budget.take_text(text)
+        images = budget.take_images(images)
         if text and name:
             text = f"{name}: {text}"
         return text, images
 
-    def _parse_onebot_content(self, content: object) -> tuple[str, list[str]]:
+    async def _parse_onebot_content(
+        self,
+        event: AstrMessageEvent,
+        content: object,
+        *,
+        budget: _ForwardBudget,
+        depth: int,
+    ) -> tuple[str, list[str]]:
         text_parts: list[str] = []
         images: list[str] = []
         if isinstance(content, str):
             return content.strip(), []
         if not isinstance(content, list):
             return "", []
+
+        nested_forward_ids: list[str] = []
         for seg in content:
+            if budget.truncated:
+                break
             if not isinstance(seg, dict):
                 continue
             seg_type = str(seg.get("type", "")).lower()
@@ -828,7 +1035,35 @@ class IsItTrue(Star):
                 if url:
                     images.append(str(url))
             elif seg_type == "forward":
+                fid = str(data.get("id") or data.get("message_id") or "").strip()
+                if fid:
+                    nested_forward_ids.append(fid)
+                else:
+                    text_parts.append("[嵌套合并转发]")
+            elif seg_type == "node":
+                # rare raw node dict; keep text-ish fallback
+                inner = data.get("content") or []
+                t, imgs = await self._parse_onebot_content(
+                    event, inner, budget=budget, depth=depth + 1
+                )
+                if t:
+                    text_parts.append(t)
+                images.extend(imgs)
+
+        # 嵌套 forward：在预算内继续展开，超出则只留占位
+        for fid in nested_forward_ids:
+            if budget.truncated or not budget.allow_depth(depth + 1):
+                text_parts.append("[嵌套合并转发已截断]")
+                break
+            nested_text, nested_imgs = await self._fetch_forward_by_id(
+                event, fid, budget=budget, depth=depth + 1
+            )
+            if nested_text:
+                text_parts.append(nested_text)
+            elif not budget.truncated:
                 text_parts.append("[嵌套合并转发]")
+            images.extend(nested_imgs)
+
         return " ".join(p for p in text_parts if p).strip(), images
 
     def _strip_triggers(self, text: str, strip_keyword: str = "") -> str:
@@ -855,10 +1090,24 @@ class IsItTrue(Star):
         text = re.sub(r"[？?]+", " ", text)
         return " ".join(text.split()).strip()
 
-    def _parse_chain(self, chain: list) -> tuple[str, list[str]]:
+    def _parse_chain(
+        self,
+        chain: list,
+        *,
+        budget: _ForwardBudget | None = None,
+        depth: int = 0,
+    ) -> tuple[str, list[str]]:
+        """Parse message chain.
+
+        When budget is provided, nested Nodes/Node are expanded under the same
+        forward-expansion limits. Without budget, nested forwards are ignored to
+        avoid unbounded recursion on plain current-message parsing.
+        """
         text_parts: list[str] = []
         images: list[str] = []
         for comp in chain or []:
+            if budget is not None and budget.truncated:
+                break
             if isinstance(comp, Plain) and comp.text:
                 text_parts.append(comp.text.strip())
             elif isinstance(comp, Image):
@@ -870,15 +1119,25 @@ class IsItTrue(Star):
                 if url:
                     images.append(str(url))
             elif isinstance(comp, Nodes):
-                t, imgs = self._parse_nodes(comp)
+                if budget is None:
+                    # 顶层普通解析不递归展开，避免无预算时被嵌套打爆
+                    text_parts.append("[合并转发]")
+                    continue
+                t, imgs = self._parse_nodes(comp, budget=budget, depth=depth + 1)
                 if t:
                     text_parts.append(t)
                 images.extend(imgs)
             elif isinstance(comp, Node):
-                t, imgs = self._parse_node(comp)
+                if budget is None:
+                    text_parts.append("[合并转发节点]")
+                    continue
+                t, imgs = self._parse_node(comp, budget=budget, depth=depth + 1)
                 if t:
                     text_parts.append(t)
                 images.extend(imgs)
+            elif isinstance(comp, Forward):
+                # bare Forward needs async API; only handled in _extract_forward_from_chain
+                text_parts.append("[合并转发]")
         return " ".join(p for p in text_parts if p).strip(), list(dict.fromkeys(images))
 
     @staticmethod

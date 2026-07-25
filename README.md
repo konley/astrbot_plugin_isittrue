@@ -59,6 +59,10 @@
 | `search_timeout` | 联网搜索超时（秒） | 30 |
 | `max_content_chars` | 待核文本最大字符数（超长截断） | 2500 |
 | `max_search_chars` | 搜索资料写入 prompt 的上限 | 2000 |
+| `max_forward_depth` | 合并转发最大嵌套层数（硬上限 8） | 4 |
+| `max_forward_nodes` | 合并转发最大节点数（硬上限 100） | 40 |
+| `max_forward_fetch` | 远程 get_forward_msg 次数（硬上限 20，含嵌套；重复 id 跳过） | 8 |
+| `max_forward_images` | 合并转发最多提取图片数（硬上限 20） | 8 |
 | `true_label` / `false_label` / `unknown_label` | 三态展示文案 | 真的喵 / 假的喵 / 布吉岛 |
 | `system_prompt` | 事实核查系统提示词 | 见默认值 |
 
@@ -87,6 +91,7 @@
 | 当前消息带图带字 | 一并提取；触发词会从文本中剥离 |
 | 合并转发（Nodes / Forward） | 尽量展开节点文本与图片；失败会在备注中说明 |
 | 嵌套转发 | 框架 `extract_quoted_message_*` 会对引用里的转发做有限跳数展开；当前消息里的裸 Forward 走 OneBot `get_forward_msg` 尽力展开 |
+| 恶意深层嵌套 | 插件侧有硬预算：深度 / 节点数 / 远程拉取次数 / 图片数 / 字符数，并做 forward id 去重防环；超限截断并在备注提示，不拖死 bot |
 
 ## 错误处理
 
@@ -116,6 +121,10 @@ astrbot_plugin_isittrue/
 ```
 
 ## 更新日志
+
+### v1.2.1
+
+- **fix/security**: 合并转发展开增加硬兜底——最大嵌套层、节点数、远程拉取次数、图片数、字符数，重复 forward id 跳过，超限截断并写备注
 
 ### v1.2.0
 
