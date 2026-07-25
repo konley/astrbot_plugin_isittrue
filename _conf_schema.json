@@ -8,31 +8,34 @@
   "trigger_phrases": {
     "description": "检测触发词列表",
     "type": "list",
-    "hint": "每行一个触发词。@机器人或引用消息时，文本包含任一触发词就会触发；开启前缀/结尾监听后，也会使用这里的词进行匹配。留空会回退为“真的吗”。",
-    "default": [
-      "真的吗"
-    ],
-    "items": {
-      "type": "string"
-    }
+    "hint": "每行一个触发词。@机器人或引用消息时，文本命中任一触发词就会触发；开启前缀/结尾监听后也会用这些词匹配。留空回退为“真的吗”。英文词会按边界匹配，避免误伤。",
+    "default": ["真的吗"],
+    "items": { "type": "string" }
   },
   "listen_suffix": {
     "description": "监听触发词结尾的消息",
     "type": "bool",
-    "hint": "开启后，群内以任一检测触发词结尾的消息会自动触发判断（无需@），同时兼容中文/英文问号结尾",
+    "hint": "开启后，群内以任一触发词结尾的消息会自动触发（无需@），兼容中英文问号",
     "default": false
   },
   "listen_prefix": {
     "description": "监听触发词开头的消息",
     "type": "bool",
-    "hint": "开启后，群内以任一检测触发词开头的消息会自动触发判断（无需@）",
+    "hint": "开启后，群内以任一触发词开头的消息会自动触发（无需@）",
     "default": false
+  },
+  "group_blacklist": {
+    "description": "群黑名单",
+    "type": "list",
+    "hint": "填群号。黑名单内的群不会触发本插件",
+    "default": [],
+    "items": { "type": "string" }
   },
   "provider_id": {
     "description": "事实核查模型 Provider ID",
     "type": "string",
-    "hint": "默认使用已配置的 openai/gpt-5.5；如果该 Provider 不存在会回退到当前默认模型",
-    "default": "openai/gpt-5.5"
+    "hint": "留空则使用当前默认 Provider；填写后优先用指定 Provider，不存在时回退默认",
+    "default": ""
   },
   "enable_vision": {
     "description": "是否启用图片分析",
@@ -43,18 +46,48 @@
   "enable_web_search": {
     "description": "启用联网搜索增强",
     "type": "bool",
-    "hint": "可选依赖 astrbot_plugin_anysearch（未安装也不影响本插件加载）。开启后先用 Anysearch 联网检索再交给模型核查；若 Anysearch 不可用会自动回退到仅凭模型知识判断",
+    "hint": "默认关闭。开启后优先调用 anysearch_search 工具；若无工具则用内置 HTTP 客户端直连 Anysearch（可读 anysearch 插件配置里的 api_key）。未装 anysearch 也不影响本插件加载",
     "default": false
   },
   "search_timeout": {
     "description": "联网搜索超时（秒）",
     "type": "int",
-    "hint": "超时后自动回退兜底",
+    "hint": "超时后自动回退到仅凭模型知识判断",
     "default": 30
+  },
+  "max_content_chars": {
+    "description": "待核文本最大字符数",
+    "type": "int",
+    "hint": "超长文本会截断后再送模型，避免撑爆上下文",
+    "default": 2500
+  },
+  "max_search_chars": {
+    "description": "搜索资料最大字符数",
+    "type": "int",
+    "hint": "联网搜索结果写入 prompt 的上限",
+    "default": 2000
+  },
+  "true_label": {
+    "description": "判定为真时的展示文案",
+    "type": "string",
+    "hint": "模型返回 true 时展示",
+    "default": "✅ 真的喵"
+  },
+  "false_label": {
+    "description": "判定为假时的展示文案",
+    "type": "string",
+    "hint": "模型返回 false 时展示",
+    "default": "❌ 假的喵"
+  },
+  "unknown_label": {
+    "description": "无法核实时的展示文案",
+    "type": "string",
+    "hint": "模型返回 unknown 时展示",
+    "default": "⚠️ 布吉岛"
   },
   "system_prompt": {
     "description": "事实核查系统提示词",
     "type": "text",
-    "default": "你是一个事实核查专家。用户会向你提供一段或多段内容（可能包含文本和图片）。请你仔细分析，判断内容的整体真实性。\n如果判断涉及时效性信息（如实时数据、最新事件、价格行情等），且你具备联网搜索能力，必须先联网检索核实后再下结论，不要仅凭记忆臆测。\n必须以如下格式回答（严格遵守，第一行只能是单个单词，不要输出任何额外前缀）：\n第一行：true（属实）/ false（不实）/ unknown（无法核实，如主观观点、预测、缺乏可验证事实）\n第二行起：用中文给出简洁的解释（100字以内）。"
+    "default": "你是群聊事实核查助手。你只能依据用户提供的「待核内容」「图片」和「参考资料」作答，不要假装自己刚刚联网搜索，也不要编造不存在的链接或新闻。\n判断原则：\n1. 只核查可验证的事实主张；主观观点、价值判断、玩笑、预测优先 unknown。\n2. 若内容含多条主张，只核查最核心、最可验证的一条，并在解释中点明。\n3. 涉及时效信息（股价、比分、突发新闻、最新政策等）且没有可用参考资料时，优先 unknown，不要用过期记忆硬判。\n4. 图片仅在可辨认关键文字/图表时作为证据；看不清就说明限制。\n5. 必须严格按以下格式输出，第一行只能是单个英文单词：\n第一行：true / false / unknown\n第二行起：中文解释，100字以内，说明依据与不确定点。"
   }
 }
