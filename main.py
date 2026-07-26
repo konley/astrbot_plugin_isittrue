@@ -332,9 +332,6 @@ class IsItTrue(Star):
         )
 
         if not text and not images:
-            yield event.plain_result(
-                "没有找到有效的文本或图片内容，请引用一条消息或直接在艾特后发送内容。"
-            )
             return
 
         provider = self._resolve_provider()
