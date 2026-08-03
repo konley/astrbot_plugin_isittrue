@@ -49,11 +49,11 @@
     "hint": "主模型（provider_id 或默认 Provider）失败后，依次尝试这里填写的 Provider ID（如 go/deepseek-v4-flash、st/sensenova-6.7-flash-lite），每个模型会先带图尝试、不行再剥图纯文本。留空表示只用主模型。可在 AstrBot 设置页查看 Provider ID",
     "default": []
   },
-  "enable_vision": {
-    "description": "是否启用图片分析",
+  "enable_web_search": {
     "type": "bool",
-    "hint": "需要当前 Provider 模型支持多模态（视觉）",
-    "default": true
+    "description": "启用联网搜索增强（总开关）",
+    "hint": "关闭则全程不联网（规划阶段也不做搜索决策）。开启后由模型综合图文规划「搜不搜/搜什么」，再按下面的 search_provider 渠道执行（auto 默认按框架配置优先：Tavily 多 Key 轮换 → 其他内置工具 → Anysearch 兜底）",
+    "default": false
   },
   "search_provider": {
     "type": "string",
@@ -69,13 +69,16 @@
       "firecrawl",
       "none"
     ],
-    "default": "auto"
+    "default": "auto",
+    "condition": {
+      "enable_web_search": true
+    }
   },
-  "enable_web_search": {
-    "description": "启用联网搜索增强",
+  "enable_vision": {
+    "description": "是否启用图片分析",
     "type": "bool",
-    "hint": "默认关闭。开启后先由模型综合图文规划「搜不搜/搜什么」，再调用 anysearch_search 或内置 HTTP。未装 anysearch 也不影响本插件加载",
-    "default": false
+    "hint": "需要当前 Provider 模型支持多模态（视觉）",
+    "default": true
   },
   "max_search_queries": {
     "description": "单次核查最多搜索词数",

@@ -291,9 +291,13 @@ class IsItTrue(Star):
         raw_fallbacks = config.get("provider_fallbacks", []) or []
         if isinstance(raw_fallbacks, str):
             raw_fallbacks = [s.strip() for s in raw_fallbacks.split(",") if s.strip()]
-        self.provider_fallbacks: list[str] = [
-            str(p).strip() for p in raw_fallbacks if str(p).strip()
-        ]
+        self.provider_fallbacks: list[str] = []
+        seen_fallback: set[str] = set()
+        for p in raw_fallbacks:
+            pid = str(p).strip()
+            if pid and pid not in seen_fallback:
+                seen_fallback.add(pid)
+                self.provider_fallbacks.append(pid)
         self.trigger_phrases: tuple[str, ...] = self._normalize_trigger_phrases(
             config.get("trigger_phrases", DEFAULT_TRIGGER_PHRASES)
         )
