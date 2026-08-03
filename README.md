@@ -53,8 +53,9 @@
 | `listen_suffix` | 监听触发词结尾的消息（无需 @） | false |
 | `listen_prefix` | 监听触发词开头的消息（无需 @） | false |
 | `group_blacklist` | 群黑名单（填群号） | `[]` |
-| `provider_id` | 事实核查模型 Provider ID；**留空=当前默认 Provider** | `""` |
-| `enable_vision` | 是否启用图片分析（需多模态） | true |
+ | `provider_id` | 事实核查模型 Provider ID；**留空=当前默认 Provider** | `""` |
+ | `provider_fallbacks` | 模型回退链（Provider ID 列表）：主模型失败后按顺序尝试，每个模型先带图再剥图；留空=只用主模型 | `[]` |
+ | `enable_vision` | 是否启用图片分析（需多模态） | true |
 | `enable_web_search` | 启用联网搜索增强（见下） | **false** |
 | `search_timeout` | 联网搜索超时（秒） | 30 |
 | `max_content_chars` | 待核文本最大字符数（超长截断） | 2500 |
@@ -90,6 +91,15 @@
 - **纯图片场景**：会先让多模态模型从图中提取一句可搜索关键词，再检索
 - **视觉降级**：模型不支持图片（image_url 400）时，自动剥图重试纯文本判定并在备注中提示
 - **兜底**：全部渠道失败 / 超时 / 无结果时自动回退「仅凭模型知识」，并在备注中提示
+
+## 模型回退（可选）
+
+默认只用一个模型（`provider_id` 或默认 Provider）。配置 `provider_fallbacks` 后可实现多模型容灾：
+
+- 主模型调用失败（网络 / 400 / 限流等）→ 自动按列表顺序切换下一个 Provider ID
+- 每个模型依次尝试「带图」→「剥图纯文本」两级降级（模型不支持图片时）
+- 全部模型都失败才提示"判断失败"
+- Provider ID 示例：`go/deepseek-v4-flash`、`st/sensenova-6.7-flash-lite` 等（以 AstrBot 设置页为准）
 
 ## 引用 / 图文 / 合并转发
 

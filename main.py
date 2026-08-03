@@ -276,7 +276,7 @@ class _InlineAnySearchClient:
     "astrbot_plugin_isittrue",
     "konley",
     "是真的吗——群聊事实核查小工具。@机器人说出你想核实的事情，或引用一条消息，AI 自动判断真假。无需额外 API，即装即用。",
-    "1.4.0",
+    "1.5.0",
     "https://github.com/konley/astrbot_plugin_isittrue",
 )
 class IsItTrue(Star):
@@ -288,6 +288,12 @@ class IsItTrue(Star):
         self.listen_prefix: bool = bool(config.get("listen_prefix", False))
         self.enable_vision: bool = bool(config.get("enable_vision", True))
         self.provider_id: str = str(config.get("provider_id", "") or "").strip()
+        raw_fallbacks = config.get("provider_fallbacks", []) or []
+        if isinstance(raw_fallbacks, str):
+            raw_fallbacks = [s.strip() for s in raw_fallbacks.split(",") if s.strip()]
+        self.provider_fallbacks: list[str] = [
+            str(p).strip() for p in raw_fallbacks if str(p).strip()
+        ]
         self.trigger_phrases: tuple[str, ...] = self._normalize_trigger_phrases(
             config.get("trigger_phrases", DEFAULT_TRIGGER_PHRASES)
         )
@@ -395,9 +401,10 @@ class IsItTrue(Star):
 
     async def initialize(self) -> None:
         logger.info(
-            f"{LOG_PREFIX} 插件已加载 v1.4.0 | triggers={list(self.trigger_phrases)} "
+            f"{LOG_PREFIX} 插件已加载 v1.5.0 | triggers={list(self.trigger_phrases)} "
             f"web_search={self.enable_web_search} provider={self.search_provider} "
             f"vision={self.enable_vision} "
+            f"fallback_providers={self.provider_fallbacks or '-'} "
             f"max_search_queries={self.max_search_queries} "
             f"blacklist={len(self.group_blacklist)}"
         )
@@ -469,7 +476,7 @@ class IsItTrue(Star):
             notes.append("引用/原文中的图片占位符已忽略，将主要依据图片与有效文字。")
 
         plan = await self._plan_verification(
-            provider, text=text, images=images, supplement=supplement, source=source
+            text=text, images=images, supplement=supplement, source=source
         )
         claim = plan.get("claim") or ""
         queries = list(plan.get("queries") or [])
@@ -533,49 +540,39 @@ class IsItTrue(Star):
             claim=claim,
         )
         image_urls = images if self.enable_vision else []
+        degrade_prompt = prompt
+        if image_urls:
+            degrade_notes = notes + [
+                "图片无法被当前模型识别（视觉通道不可用），本次仅依据文字与参考资料判定。"
+            ]
+            degrade_prompt = self._build_user_prompt(
+                source=source,
+                text=text,
+                images=[],
+                supplement=supplement,
+                search_block=search_block,
+                notes=degrade_notes,
+                claim=claim,
+            )
 
         try:
-            llm_resp = await provider.text_chat(
-                prompt=prompt,
+            llm_resp, _label, degraded = await self._chat_with_fallback(
+                prompt_with_images=prompt,
+                prompt_without_images=degrade_prompt,
                 image_urls=image_urls,
                 system_prompt=self.system_prompt,
+                stage="终判",
             )
             content = (llm_resp.completion_text or "").strip()
-            logger.info(f"{LOG_PREFIX} 模型返回：{content[:200]!r}")
-        except Exception as e:  # noqa: BLE001
-            if image_urls:
-                # 视觉通道不可用（如模型不支持 image_url）：剥图降级纯文本判定
-                logger.warning(f"{LOG_PREFIX} 带图调用失败({e})，自动降级为纯文本判定")
-                try:
-                    degrade_notes = notes + [
-                        "图片无法被当前模型识别（视觉通道不可用），本次仅依据文字与参考资料判定。"
-                    ]
-                    degrade_prompt = self._build_user_prompt(
-                        source=source,
-                        text=text,
-                        images=[],
-                        supplement=supplement,
-                        search_block=search_block,
-                        notes=degrade_notes,
-                        claim=claim,
-                    )
-                    llm_resp = await provider.text_chat(
-                        prompt=degrade_prompt,
-                        image_urls=[],
-                        system_prompt=self.system_prompt,
-                    )
-                    content = (llm_resp.completion_text or "").strip()
-                    logger.info(f"{LOG_PREFIX} 降级后模型返回：{content[:200]!r}")
-                except Exception as e2:  # noqa: BLE001
-                    err_msg = str(e2)
-                    logger.exception(f"{LOG_PREFIX} 降级调用仍失败: {err_msg}")
-                    yield event.plain_result(self._friendly_error(err_msg))
-                    return
+            if degraded:
+                logger.info(f"{LOG_PREFIX} 模型返回（降级判定）：{content[:200]!r}")
             else:
-                err_msg = str(e)
-                logger.exception(f"{LOG_PREFIX} 调用大模型失败: {err_msg}")
-                yield event.plain_result(self._friendly_error(err_msg))
-                return
+                logger.info(f"{LOG_PREFIX} 模型返回：{content[:200]!r}")
+        except Exception as e:  # noqa: BLE001
+            err_msg = str(e)
+            logger.exception(f"{LOG_PREFIX} 全部模型回退链调用失败: {err_msg}")
+            yield event.plain_result(self._friendly_error(err_msg))
+            return
 
         if not content:
             yield event.plain_result("模型未返回有效内容。")
@@ -592,6 +589,96 @@ class IsItTrue(Star):
                 f"{LOG_PREFIX} 未找到 provider_id={self.provider_id!r}，回退默认 Provider"
             )
         return self.context.get_using_provider()
+
+    def _resolve_providers(self) -> list[Any]:
+        """模型回退链：主 provider → provider_fallbacks 依次 → 默认 provider 兜底，去重。"""
+        order: list[Any] = []
+        seen_ids: set[str] = set()
+
+        def _add(p) -> None:
+            if p is None:
+                return
+            try:
+                pid = str(p.provider_config.get("id", ""))
+            except Exception:  # noqa: BLE001
+                pid = ""
+            if pid in seen_ids:
+                return
+            seen_ids.add(pid)
+            order.append(p)
+
+        if self.provider_id:
+            _add(self.context.get_provider_by_id(self.provider_id))
+        for fallback_id in self.provider_fallbacks:
+            if fallback_id and fallback_id not in seen_ids:
+                _add(self.context.get_provider_by_id(fallback_id))
+        _add(self.context.get_using_provider())
+        if not order:
+            order.append(self.context.get_using_provider())
+        return order
+
+    def _provider_label(self, provider) -> str:
+        try:
+            return (
+                str(provider.provider_config.get("id", "")) or type(provider).__name__
+            )
+        except Exception:  # noqa: BLE001
+            return type(provider).__name__
+
+    async def _chat_with_fallback(
+        self,
+        *,
+        prompt_with_images: str,
+        prompt_without_images: str,
+        image_urls: list[str],
+        system_prompt: str,
+        stage: str,
+    ) -> tuple[Any, str, bool]:
+        """按模型回退链调用 text_chat。
+
+        每个模型依次尝试「带图」→「剥图」，全部失败才抛最后一个异常。
+        返回 (llm_resp, provider_label, degraded)。
+        """
+        providers = self._resolve_providers()
+        if not providers:
+            raise RuntimeError("未配置任何可用的模型 Provider")
+        last_err: Exception | None = None
+        for provider in providers:
+            label = self._provider_label(provider)
+            # 1) 带图尝试
+            try:
+                resp = await provider.text_chat(
+                    prompt=prompt_with_images,
+                    image_urls=image_urls,
+                    system_prompt=system_prompt,
+                )
+                logger.info(
+                    f"{LOG_PREFIX} {stage} 调用成功 provider={label} vision={'on' if image_urls else 'off'}"
+                )
+                return resp, label, False
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                logger.warning(
+                    f"{LOG_PREFIX} {stage} provider={label} 带图调用失败：{e}"
+                )
+            # 2) 剥图重试（当前模型可能不支持图片）
+            if image_urls:
+                try:
+                    resp = await provider.text_chat(
+                        prompt=prompt_without_images,
+                        image_urls=[],
+                        system_prompt=system_prompt,
+                    )
+                    logger.info(f"{LOG_PREFIX} {stage} 剥图重试成功 provider={label}")
+                    return resp, label, True
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+                    logger.warning(
+                        f"{LOG_PREFIX} {stage} provider={label} 剥图调用失败：{e}"
+                    )
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError(f"{stage} 全部模型回退链调用失败")
 
     def _build_user_prompt(
         self,
@@ -842,7 +929,6 @@ class IsItTrue(Star):
 
     async def _plan_verification(
         self,
-        provider,
         *,
         text: str,
         images: list[str],
@@ -877,12 +963,19 @@ class IsItTrue(Star):
             user_bits.append(f"图片：有 {len(images)} 张但当前未启用视觉。")
         else:
             user_bits.append("图片：无")
+        plan_prompt_text = "\n".join(user_bits)
+        # 剥图版 prompt：视觉通道全部不可用时使用
+        degrade_bits = [bit for bit in user_bits if not bit.startswith("图片：")]
+        degrade_bits.append(f"图片：有 {len(images)} 张但视觉通道不可用，本次未附带。")
+        degrade_prompt_text = "\n".join(degrade_bits)
 
         try:
-            resp = await provider.text_chat(
-                prompt="\n".join(user_bits),
+            resp, _label, _degraded = await self._chat_with_fallback(
+                prompt_with_images=plan_prompt_text,
+                prompt_without_images=degrade_prompt_text,
                 image_urls=vision_urls,
                 system_prompt=self.plan_prompt,
+                stage="规划",
             )
             raw = (resp.completion_text or "").strip()
             logger.info(f"{LOG_PREFIX} 规划原始返回：{raw[:240]!r}")
@@ -897,28 +990,6 @@ class IsItTrue(Star):
                 reason="规划输出无法解析，已规则回退",
             )
         except Exception as e:  # noqa: BLE001
-            if vision_urls:
-                # 视觉通道不可用：剥图重试一次规划，再失败才走规则回退
-                logger.warning(f"{LOG_PREFIX} 规划带图调用失败({e})，剥图重试")
-                try:
-                    degrade_bits = [
-                        bit for bit in user_bits if not bit.startswith("图片：")
-                    ]
-                    degrade_bits.append(
-                        f"图片：有 {len(images)} 张但视觉通道不可用，本次未附带。"
-                    )
-                    resp = await provider.text_chat(
-                        prompt="\n".join(degrade_bits),
-                        image_urls=[],
-                        system_prompt=self.plan_prompt,
-                    )
-                    raw = (resp.completion_text or "").strip()
-                    logger.info(f"{LOG_PREFIX} 规划剥图重试返回：{raw[:240]!r}")
-                    parsed = self._parse_plan_response(raw)
-                    if parsed is not None:
-                        return parsed
-                except Exception as e2:  # noqa: BLE001
-                    logger.warning(f"{LOG_PREFIX} 规划剥图重试失败：{e2}")
             logger.warning(f"{LOG_PREFIX} 规划调用失败，走规则回退：{e}")
             return self._fallback_plan(
                 text=text,

@@ -43,6 +43,12 @@
     "hint": "留空则使用当前默认 Provider；填写后优先用指定 Provider，不存在时回退默认",
     "default": ""
   },
+  "provider_fallbacks": {
+    "type": "list",
+    "description": "模型回退链（Provider ID 列表，按顺序尝试）",
+    "hint": "主模型（provider_id 或默认 Provider）失败后，依次尝试这里填写的 Provider ID（如 go/deepseek-v4-flash、st/sensenova-6.7-flash-lite），每个模型会先带图尝试、不行再剥图纯文本。留空表示只用主模型。可在 AstrBot 设置页查看 Provider ID",
+    "default": []
+  },
   "enable_vision": {
     "description": "是否启用图片分析",
     "type": "bool",
