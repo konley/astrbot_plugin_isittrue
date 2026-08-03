@@ -73,14 +73,23 @@
 开启 `enable_web_search` 后，插件会在调模型前：
 
 1. 从待核文本 / 用户补充 / 图片中提炼可搜索的核心主张（长文会先抽取）
-2. **优先**调用已注册的 `anysearch_search` 工具
-3. 若工具不可用，则用**内置 HTTP 客户端**直连 Anysearch（`https://api.anysearch.com/mcp`），并尝试读取 anysearch 插件配置中的 `api_key`
-4. 把检索结果写入结构化 prompt 的「参考资料」段
+2. 按 `search_provider` 选渠道检索（见下表），把结果写入结构化 prompt 的「参考资料」段
+
+### 搜索渠道（`search_provider`，默认 `auto`）
+
+| 渠道 | 行为 |
+|------|------|
+| `auto` | 按框架配置的 `websearch_provider` 优先，失败自动降级：Tavily 多 Key 轮换 + failover（401/403/429/432 自动换 Key）→ 其他框架内置工具（bocha / baidu_ai_search / brave / firecrawl）→ Anysearch 兜底 |
+| `tavily` | 直连 Tavily `/search`，自动读取框架 `provider_settings.websearch_tavily_key`（多 Key round-robin），无需手动填 Key |
+| `anysearch` | 优先已注册的 `anysearch_search` 工具；工具不可用时用内置 HTTP 客户端直连 Anysearch 并尝试读取 anysearch 插件配置中的 `api_key` |
+| `bocha` / `baidu_ai_search` / `brave` / `firecrawl` | 调用框架内置对应搜索工具 |
+| `none` | 关闭联网搜索 |
 
 - **不是硬依赖**：未安装 `astrbot_plugin_anysearch` 时本插件仍可正常加载与使用
-- **默认关闭**：需要时效增强时再手动打开
+- **默认关闭**：需要时效增强时再手动打开（`enable_web_search`）
 - **纯图片场景**：会先让多模态模型从图中提取一句可搜索关键词，再检索
-- **兜底**：搜索失败 / 超时 / 无结果时自动回退「仅凭模型知识」，并在备注中提示
+- **视觉降级**：模型不支持图片（image_url 400）时，自动剥图重试纯文本判定并在备注中提示
+- **兜底**：全部渠道失败 / 超时 / 无结果时自动回退「仅凭模型知识」，并在备注中提示
 
 ## 引用 / 图文 / 合并转发
 

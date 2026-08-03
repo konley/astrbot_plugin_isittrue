@@ -1,6 +1,6 @@
 name: astrbot_plugin_isittrue
 desc: 是真的吗——群聊事实核查小工具。@机器人说出你想核实的事情，或引用一条消息，AI 自动判断真假。无需额外 API，即装即用。
-version: 1.2.1
+version: 1.4.0
 author: konley
 display_name: 是真的吗
 repo: https://github.com/konley/astrbot_plugin_isittrue

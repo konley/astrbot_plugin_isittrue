@@ -49,11 +49,33 @@
     "hint": "需要当前 Provider 模型支持多模态（视觉）",
     "default": true
   },
+  "search_provider": {
+    "type": "string",
+    "description": "联网搜索渠道",
+    "hint": "auto=按框架配置的 websearch_provider 优先，失败自动降级（Tavily 多 Key 轮换 → 其他内置渠道 → Anysearch 兜底）；tavily=直连 Tavily 并自动读取框架配置的 Key；anysearch=Anysearch 工具/直连；bocha/baidu_ai_search/brave/firecrawl=调用框架内置工具；none=关闭联网搜索",
+    "options": [
+      "auto",
+      "tavily",
+      "anysearch",
+      "bocha",
+      "baidu_ai_search",
+      "brave",
+      "firecrawl",
+      "none"
+    ],
+    "default": "auto"
+  },
   "enable_web_search": {
     "description": "启用联网搜索增强",
     "type": "bool",
-    "hint": "默认关闭。开启后优先调用 anysearch_search 工具；若无工具则用内置 HTTP 客户端直连 Anysearch（可读 anysearch 插件配置里的 api_key）。未装 anysearch 也不影响本插件加载",
+    "hint": "默认关闭。开启后先由模型综合图文规划「搜不搜/搜什么」，再调用 anysearch_search 或内置 HTTP。未装 anysearch 也不影响本插件加载",
     "default": false
+  },
+  "max_search_queries": {
+    "description": "单次核查最多搜索词数",
+    "type": "int",
+    "hint": "规划阶段最多采纳几个搜索词（1-3）。默认 2",
+    "default": 2
   },
   "search_timeout": {
     "description": "联网搜索超时（秒）",
@@ -92,9 +114,16 @@
     "default": "⚠️ 布吉岛"
   },
   "system_prompt": {
-    "description": "事实核查系统提示词",
+    "description": "事实核查系统提示词（终判）",
     "type": "text",
-    "default": "你是群聊事实核查助手。你只能依据用户提供的「待核内容」「图片」和「参考资料」作答，不要假装自己刚刚联网搜索，也不要编造不存在的链接或新闻。\n判断原则：\n1. 只核查可验证的事实主张；主观观点、价值判断、玩笑、预测优先 unknown。\n2. 若内容含多条主张，只核查最核心、最可验证的一条，并在解释中点明。\n3. 涉及时效信息（股价、比分、突发新闻、最新政策等）且没有可用参考资料时，优先 unknown，不要用过期记忆硬判。\n4. 图片仅在可辨认关键文字/图表时作为证据；看不清就说明限制。\n5. 必须严格按以下格式输出，第一行只能是单个英文单词：\n第一行：true / false / unknown\n第二行起：中文解释，100字以内，说明依据与不确定点。"
+    "hint": "最终 true/false/unknown 判定用。修改后立即生效于新触发。",
+    "default": "你是群聊事实核查助手。综合「待核主张」「原始文本」「图片」和「参考资料」作答；不要假装自己刚刚联网搜索，也不要编造不存在的链接或新闻。\n判断原则：\n1. 只核查可验证的事实主张；主观观点、价值判断、玩笑、预测优先 unknown。\n2. 若内容含多条主张，只核查最核心、最可验证的一条，并在解释中点明。\n3. 必须同时参考图片可见内容与文字；任一侧有关键事实信息都不可忽略。\n4. 涉及时效信息时：有可用参考资料或图文与公开报道高度一致，可判 true/false；仅当图文与资料均不足以支撑时才 unknown，不要仅因「没有官网全文」就 unknown。\n5. 媒体报道截图、部门回应等可作为佐证，但需在解释里写明依据与不确定点（例如日期可能有误、后续结论未出）。\n6. 图片看不清、无文字主张、纯主观内容 → unknown，并说明限制。\n7. 必须严格按以下格式输出，第一行只能是单个英文单词：\n第一行：true / false / unknown\n第二行起：中文解释，100字以内，说明依据与不确定点。"
+  },
+  "plan_prompt": {
+    "description": "核查规划系统提示词",
+    "type": "text",
+    "hint": "综合图文决定核心主张与搜索词。输出 CLAIM/SEARCH/NEED_SEARCH/NOTE 四行协议。",
+    "default": "你在为事实核查准备材料。请同时阅读用户文字与图片（若有），提炼最值得核查的一条核心主张，并决定是否需要联网搜索、搜什么。\n规则：\n1. 文字与图片都要看；图中有新闻标题/正文/图表时必须纳入主张。\n2. 忽略 [Image]、[图片] 等占位符，它们不是有效内容。\n3. 无任何可验证事实（纯情绪、玩笑、无信息图）时：NEED_SEARCH=no，CLAIM 可空，SEARCH=none。\n4. 搜索词要可直接用于搜索引擎：含人物/地点/事件/媒体名等实体，禁止输出「图片」「截图」「[Image]」「如图」等空词。\n5. 最多给出 2 个搜索词，用 | 分隔；不需要搜索时 SEARCH=none。\n6. 严格按下面四行输出，不要其它解释：\nCLAIM: <一句核心主张，可空>\nSEARCH: <词1> | <词2> 或 none\nNEED_SEARCH: yes 或 no\nNOTE: <可选一句说明>"
   },
   "max_forward_depth": {
     "description": "合并转发最大嵌套层数",

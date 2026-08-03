@@ -20,18 +20,71 @@ DEFAULT_TRIGGER_PHRASES = ("真的吗",)
 DEFAULT_TRUE_LABEL = "✅ 真的喵"
 DEFAULT_FALSE_LABEL = "❌ 假的喵"
 DEFAULT_UNKNOWN_LABEL = "⚠️ 布吉岛"
+DEFAULT_MAX_SEARCH_QUERIES = 2
+# 联网搜索渠道（与 AstrBot 框架 provider_settings.websearch_provider 取值对齐）
+SEARCH_PROVIDER_OPTIONS = (
+    "auto",
+    "tavily",
+    "anysearch",
+    "bocha",
+    "baidu_ai_search",
+    "brave",
+    "firecrawl",
+    "none",
+)
+# auto 模式的降级顺序：tavily 优先（多 Key 轮换+failover），anysearch 兜底
+SEARCH_FALLBACK_ORDER = (
+    "tavily",
+    "bocha",
+    "baidu_ai_search",
+    "brave",
+    "firecrawl",
+    "anysearch",
+)
+# Tavily 等 Key 相关失败状态码：换下一个 Key 重试
+_RETRYABLE_HTTP_STATUSES = frozenset({401, 403, 429, 432})
+# 框架/客户端常见图片占位，不能当有效待核文本或搜索词
+_IMAGE_PLACEHOLDER_RE = re.compile(
+    r"^\s*(?:"
+    r"\[(?:Image|image|IMAGE|图片|圖像|写真)\]"
+    r"|【(?:图片|圖像)】"
+    r"|\[(?:img|IMG)\]"
+    r")+\s*$"
+)
+_IMAGE_PLACEHOLDER_TOKEN_RE = re.compile(
+    r"\[(?:Image|image|IMAGE|图片|圖像|写真|img|IMG)\]|【(?:图片|圖像)】"
+)
 DEFAULT_SYSTEM_PROMPT = (
-    "你是群聊事实核查助手。你只能依据用户提供的「待核内容」「图片」和「参考资料」作答，"
+    "你是群聊事实核查助手。综合「待核主张」「原始文本」「图片」和「参考资料」作答；"
     "不要假装自己刚刚联网搜索，也不要编造不存在的链接或新闻。\n"
     "判断原则：\n"
     "1. 只核查可验证的事实主张；主观观点、价值判断、玩笑、预测优先 unknown。\n"
     "2. 若内容含多条主张，只核查最核心、最可验证的一条，并在解释中点明。\n"
-    "3. 涉及时效信息（股价、比分、突发新闻、最新政策等）且没有可用参考资料时，优先 unknown，"
-    "不要用过期记忆硬判。\n"
-    "4. 图片仅在可辨认关键文字/图表时作为证据；看不清就说明限制。\n"
-    "5. 必须严格按以下格式输出，第一行只能是单个英文单词：\n"
+    "3. 必须同时参考图片可见内容与文字；任一侧有关键事实信息都不可忽略。\n"
+    "4. 涉及时效信息时：有可用参考资料或图文与公开报道高度一致，可判 true/false；"
+    "仅当图文与资料均不足以支撑时才 unknown，不要仅因「没有官网全文」就 unknown。\n"
+    "5. 媒体报道截图、部门回应等可作为佐证，但需在解释里写明依据与不确定点"
+    "（例如日期可能有误、后续结论未出）。\n"
+    "6. 图片看不清、无文字主张、纯主观内容 → unknown，并说明限制。\n"
+    "7. 必须严格按以下格式输出，第一行只能是单个英文单词：\n"
     "第一行：true / false / unknown\n"
     "第二行起：中文解释，100字以内，说明依据与不确定点。"
+)
+DEFAULT_PLAN_PROMPT = (
+    "你在为事实核查准备材料。请同时阅读用户文字与图片（若有），"
+    "提炼最值得核查的一条核心主张，并决定是否需要联网搜索、搜什么。\n"
+    "规则：\n"
+    "1. 文字与图片都要看；图中有新闻标题/正文/图表时必须纳入主张。\n"
+    "2. 忽略 [Image]、[图片] 等占位符，它们不是有效内容。\n"
+    "3. 无任何可验证事实（纯情绪、玩笑、无信息图）时：NEED_SEARCH=no，CLAIM 可空，SEARCH=none。\n"
+    "4. 搜索词要可直接用于搜索引擎：含人物/地点/事件/媒体名等实体，"
+    "禁止输出「图片」「截图」「[Image]」「如图」等空词。\n"
+    "5. 最多给出 2 个搜索词，用 | 分隔；不需要搜索时 SEARCH=none。\n"
+    "6. 严格按下面四行输出，不要其它解释：\n"
+    "CLAIM: <一句核心主张，可空>\n"
+    "SEARCH: <词1> | <词2> 或 none\n"
+    "NEED_SEARCH: yes 或 no\n"
+    "NOTE: <可选一句说明>"
 )
 
 # 合并转发展开硬上限，防恶意深层嵌套 / 环
@@ -223,7 +276,7 @@ class _InlineAnySearchClient:
     "astrbot_plugin_isittrue",
     "konley",
     "是真的吗——群聊事实核查小工具。@机器人说出你想核实的事情，或引用一条消息，AI 自动判断真假。无需额外 API，即装即用。",
-    "1.2.1",
+    "1.4.0",
     "https://github.com/konley/astrbot_plugin_isittrue",
 )
 class IsItTrue(Star):
@@ -242,7 +295,23 @@ class IsItTrue(Star):
             config.get("group_blacklist", [])
         )
         self.enable_web_search: bool = bool(config.get("enable_web_search", False))
+        self.search_provider: str = (
+            str(config.get("search_provider", "auto") or "auto").strip().lower()
+        )
+        if self.search_provider not in SEARCH_PROVIDER_OPTIONS:
+            self.search_provider = "auto"
+        self._tavily_key_idx: int = 0  # Tavily 多 Key 轮换指针
         self.search_timeout: int = max(5, int(config.get("search_timeout", 30) or 30))
+        self.max_search_queries: int = min(
+            3,
+            max(
+                1,
+                int(
+                    config.get("max_search_queries", DEFAULT_MAX_SEARCH_QUERIES)
+                    or DEFAULT_MAX_SEARCH_QUERIES
+                ),
+            ),
+        )
         self.max_content_chars: int = max(
             200, int(config.get("max_content_chars", 2500) or 2500)
         )
@@ -251,45 +320,91 @@ class IsItTrue(Star):
         )
         # 合并转发兜底：深度/节点/远程拉取/图片，全部硬夹紧
         self.max_forward_depth: int = min(
-            8, max(1, int(config.get("max_forward_depth", DEFAULT_MAX_FORWARD_DEPTH) or DEFAULT_MAX_FORWARD_DEPTH))
+            8,
+            max(
+                1,
+                int(
+                    config.get("max_forward_depth", DEFAULT_MAX_FORWARD_DEPTH)
+                    or DEFAULT_MAX_FORWARD_DEPTH
+                ),
+            ),
         )
         self.max_forward_nodes: int = min(
-            100, max(1, int(config.get("max_forward_nodes", DEFAULT_MAX_FORWARD_NODES) or DEFAULT_MAX_FORWARD_NODES))
+            100,
+            max(
+                1,
+                int(
+                    config.get("max_forward_nodes", DEFAULT_MAX_FORWARD_NODES)
+                    or DEFAULT_MAX_FORWARD_NODES
+                ),
+            ),
         )
         self.max_forward_fetch: int = min(
-            20, max(1, int(config.get("max_forward_fetch", DEFAULT_MAX_FORWARD_FETCH) or DEFAULT_MAX_FORWARD_FETCH))
+            20,
+            max(
+                1,
+                int(
+                    config.get("max_forward_fetch", DEFAULT_MAX_FORWARD_FETCH)
+                    or DEFAULT_MAX_FORWARD_FETCH
+                ),
+            ),
         )
         self.max_forward_images: int = min(
-            20, max(1, int(config.get("max_forward_images", DEFAULT_MAX_FORWARD_IMAGES) or DEFAULT_MAX_FORWARD_IMAGES))
+            20,
+            max(
+                1,
+                int(
+                    config.get("max_forward_images", DEFAULT_MAX_FORWARD_IMAGES)
+                    or DEFAULT_MAX_FORWARD_IMAGES
+                ),
+            ),
         )
         self.true_label: str = (
-            str(config.get("true_label", DEFAULT_TRUE_LABEL) or DEFAULT_TRUE_LABEL).strip()
+            str(
+                config.get("true_label", DEFAULT_TRUE_LABEL) or DEFAULT_TRUE_LABEL
+            ).strip()
             or DEFAULT_TRUE_LABEL
         )
         self.false_label: str = (
-            str(config.get("false_label", DEFAULT_FALSE_LABEL) or DEFAULT_FALSE_LABEL).strip()
+            str(
+                config.get("false_label", DEFAULT_FALSE_LABEL) or DEFAULT_FALSE_LABEL
+            ).strip()
             or DEFAULT_FALSE_LABEL
         )
         self.unknown_label: str = (
             str(
-                config.get("unknown_label", DEFAULT_UNKNOWN_LABEL) or DEFAULT_UNKNOWN_LABEL
+                config.get("unknown_label", DEFAULT_UNKNOWN_LABEL)
+                or DEFAULT_UNKNOWN_LABEL
             ).strip()
             or DEFAULT_UNKNOWN_LABEL
         )
-        self.system_prompt: str = str(
-            config.get("system_prompt", DEFAULT_SYSTEM_PROMPT) or DEFAULT_SYSTEM_PROMPT
-        ).strip() or DEFAULT_SYSTEM_PROMPT
+        self.system_prompt: str = (
+            str(
+                config.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+                or DEFAULT_SYSTEM_PROMPT
+            ).strip()
+            or DEFAULT_SYSTEM_PROMPT
+        )
+        self.plan_prompt: str = (
+            str(
+                config.get("plan_prompt", DEFAULT_PLAN_PROMPT) or DEFAULT_PLAN_PROMPT
+            ).strip()
+            or DEFAULT_PLAN_PROMPT
+        )
         self._cooldowns: dict[str, float] = {}
 
     async def initialize(self) -> None:
         logger.info(
-            f"{LOG_PREFIX} 插件已加载 v1.2.1 | triggers={list(self.trigger_phrases)} "
-            f"web_search={self.enable_web_search} vision={self.enable_vision} "
+            f"{LOG_PREFIX} 插件已加载 v1.4.0 | triggers={list(self.trigger_phrases)} "
+            f"web_search={self.enable_web_search} provider={self.search_provider} "
+            f"vision={self.enable_vision} "
+            f"max_search_queries={self.max_search_queries} "
             f"blacklist={len(self.group_blacklist)}"
         )
 
     async def terminate(self) -> None:
         logger.info(f"{LOG_PREFIX} 插件卸载/重载")
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_message(self, event: AstrMessageEvent):
         """Trigger paths:
@@ -320,18 +435,22 @@ class IsItTrue(Star):
             return
 
         bundle = await self._extract_bundle(event, strip_keyword)
-        text = bundle["text"]
+        raw_text = bundle["text"]
         images = bundle["images"]
-        supplement = bundle["supplement"]
+        raw_supplement = bundle["supplement"]
         source = bundle["source"]
         image_note = bundle["image_note"]
 
+        text = self._sanitize_claim_text(raw_text)
+        supplement = self._sanitize_claim_text(raw_supplement)
+
         logger.info(
             f"{LOG_PREFIX} 提取 | source={source} text_len={len(text)} "
-            f"images={len(images)} supplement_len={len(supplement)} note={image_note!r}"
+            f"raw_text_len={len(raw_text or '')} images={len(images)} "
+            f"supplement_len={len(supplement)} note={image_note!r}"
         )
 
-        if not text and not images:
+        if not text and not images and not supplement:
             return
 
         provider = self._resolve_provider()
@@ -346,26 +465,58 @@ class IsItTrue(Star):
         notes: list[str] = []
         if image_note:
             notes.append(image_note)
+        if raw_text and not text:
+            notes.append("引用/原文中的图片占位符已忽略，将主要依据图片与有效文字。")
+
+        plan = await self._plan_verification(
+            provider, text=text, images=images, supplement=supplement, source=source
+        )
+        claim = plan.get("claim") or ""
+        queries = list(plan.get("queries") or [])
+        need_search = bool(plan.get("need_search"))
+        plan_note = str(plan.get("note") or "").strip()
+        plan_fallback = bool(plan.get("fallback"))
+
+        logger.info(
+            f"{LOG_PREFIX} 规划 | claim={claim!r} need_search={need_search} "
+            f"queries={queries!r} fallback={plan_fallback} note={plan_note!r}"
+        )
+        if plan_note:
+            notes.append(plan_note)
 
         search_block = ""
         if self.enable_web_search:
-            search_query = await self._build_search_query(
-                provider, text=text, images=images, supplement=supplement
-            )
-            if search_query:
-                logger.info(f"{LOG_PREFIX} 准备联网搜索：{search_query!r}")
-                search_block = await self._web_search(search_query, event=event)
-                if search_block:
-                    logger.info(
-                        f"{LOG_PREFIX} 搜索成功 len={len(search_block)} "
-                        f"preview={search_block[:120]!r}"
+            if need_search and queries:
+                blocks: list[str] = []
+                per_limit = max(
+                    400,
+                    self.max_search_chars
+                    // max(1, min(len(queries), self.max_search_queries)),
+                )
+                for q in queries[: self.max_search_queries]:
+                    logger.info(f"{LOG_PREFIX} 准备联网搜索：{q!r}")
+                    one = await self._web_search(q, event=event)
+                    if one:
+                        blocks.append(f"### 查询：{q}\n{one}")
+                        logger.info(
+                            f"{LOG_PREFIX} 搜索成功 query={q!r} len={len(one)} "
+                            f"preview={one[:120]!r}"
+                        )
+                    else:
+                        logger.info(f"{LOG_PREFIX} 搜索空结果 query={q!r}")
+                if blocks:
+                    search_block = self._truncate(
+                        "\n\n".join(blocks), self.max_search_chars
                     )
                 else:
-                    notes.append("联网搜索未返回可用资料，已回退模型知识判断。")
-                    logger.info(f"{LOG_PREFIX} 搜索空结果，回退兜底")
+                    notes.append("联网搜索未返回可用资料，已回退图文综合判断。")
+                    logger.info(f"{LOG_PREFIX} 全部搜索空结果，回退兜底")
+            elif need_search and not queries:
+                notes.append("模型认为需要联网但未给出有效搜索词，已跳过搜索。")
+                logger.info(f"{LOG_PREFIX} need_search 但无 queries，跳过搜索")
             else:
-                notes.append("未能生成有效搜索词，已跳过联网搜索。")
-                logger.info(f"{LOG_PREFIX} 无有效搜索词，跳过搜索")
+                notes.append("模型判定无需联网，已直接综合图文判断。")
+                logger.info(f"{LOG_PREFIX} 规划判定无需搜索")
         else:
             logger.info(f"{LOG_PREFIX} 联网搜索未开启")
 
@@ -379,6 +530,7 @@ class IsItTrue(Star):
             supplement=supplement,
             search_block=search_block,
             notes=notes,
+            claim=claim,
         )
         image_urls = images if self.enable_vision else []
 
@@ -391,10 +543,39 @@ class IsItTrue(Star):
             content = (llm_resp.completion_text or "").strip()
             logger.info(f"{LOG_PREFIX} 模型返回：{content[:200]!r}")
         except Exception as e:  # noqa: BLE001
-            err_msg = str(e)
-            logger.exception(f"{LOG_PREFIX} 调用大模型失败: {err_msg}")
-            yield event.plain_result(self._friendly_error(err_msg))
-            return
+            if image_urls:
+                # 视觉通道不可用（如模型不支持 image_url）：剥图降级纯文本判定
+                logger.warning(f"{LOG_PREFIX} 带图调用失败({e})，自动降级为纯文本判定")
+                try:
+                    degrade_notes = notes + [
+                        "图片无法被当前模型识别（视觉通道不可用），本次仅依据文字与参考资料判定。"
+                    ]
+                    degrade_prompt = self._build_user_prompt(
+                        source=source,
+                        text=text,
+                        images=[],
+                        supplement=supplement,
+                        search_block=search_block,
+                        notes=degrade_notes,
+                        claim=claim,
+                    )
+                    llm_resp = await provider.text_chat(
+                        prompt=degrade_prompt,
+                        image_urls=[],
+                        system_prompt=self.system_prompt,
+                    )
+                    content = (llm_resp.completion_text or "").strip()
+                    logger.info(f"{LOG_PREFIX} 降级后模型返回：{content[:200]!r}")
+                except Exception as e2:  # noqa: BLE001
+                    err_msg = str(e2)
+                    logger.exception(f"{LOG_PREFIX} 降级调用仍失败: {err_msg}")
+                    yield event.plain_result(self._friendly_error(err_msg))
+                    return
+            else:
+                err_msg = str(e)
+                logger.exception(f"{LOG_PREFIX} 调用大模型失败: {err_msg}")
+                yield event.plain_result(self._friendly_error(err_msg))
+                return
 
         if not content:
             yield event.plain_result("模型未返回有效内容。")
@@ -421,34 +602,53 @@ class IsItTrue(Star):
         supplement: str,
         search_block: str,
         notes: list[str],
+        claim: str = "",
     ) -> str:
-        claim_text = text or "（无文本，请主要依据图片判断）"
-        claim_text = self._truncate(claim_text, self.max_content_chars)
+        raw_text = self._truncate(
+            text or "（无有效文本，请主要依据图片判断）",
+            self.max_content_chars,
+        )
+        claim_text = self._truncate(
+            (claim or text or "").strip() or "（无明确主张，请综合图文判断）",
+            min(500, self.max_content_chars // 2),
+        )
         supplement = self._truncate(supplement, min(500, self.max_content_chars // 2))
         search_block = self._truncate(search_block, self.max_search_chars)
 
         parts = [
-            "【任务】请核查下列内容的真实性，并严格按系统要求的格式输出。",
+            "【任务】请综合文字与图片核查真实性，并严格按系统要求的格式输出。",
             f"【来源】{source}",
+            f"【待核主张】{claim_text}",
         ]
         if supplement:
             parts.append(f"【用户补充】{supplement}")
-        parts.append(f"【待核文本】{claim_text}")
+        if text and claim and text.strip() != claim.strip():
+            parts.append(f"【原始文本】{raw_text}")
+        elif not claim:
+            parts.append(f"【原始文本】{raw_text}")
         if images:
             if self.enable_vision:
-                parts.append(f"【图片】共 {len(images)} 张，已随请求附带，请结合图片内容。")
+                parts.append(
+                    f"【图片】共 {len(images)} 张，已随请求附带；"
+                    "请阅读图中文字、标题、图表，与主张、资料交叉核对。"
+                )
             else:
                 parts.append(f"【图片】共 {len(images)} 张，但当前未启用图片分析。")
         if search_block:
-            parts.append(f"【参考资料】\n{search_block}")
+            parts.append(
+                "【参考资料】以下为联网结果，可能含噪声或无关页；"
+                "可作佐证但不要把搜索首页/无关聚合页当铁证。\n"
+                f"{search_block}"
+            )
         else:
-            parts.append("【参考资料】无")
+            parts.append("【参考资料】无（请主要依据图文本身；依据不足则 unknown）")
         if notes:
             parts.append("【备注】" + "；".join(notes))
         parts.append(
             "【输出】第一行 true/false/unknown；第二行起中文解释（100字以内）。"
         )
         return "\n".join(parts)
+
     def _format_verdict(self, content: str) -> str:
         lines = content.strip().splitlines()
         if not lines:
@@ -486,7 +686,10 @@ class IsItTrue(Star):
         }[verdict]
         if rest:
             rest_lines = rest.splitlines()
-            if rest_lines and self._parse_verdict_token(rest_lines[0].strip()) == verdict:
+            if (
+                rest_lines
+                and self._parse_verdict_token(rest_lines[0].strip()) == verdict
+            ):
                 rest = "\n".join(rest_lines[1:]).strip()
         return f"{label}\n{rest}" if rest else label
 
@@ -538,71 +741,465 @@ class IsItTrue(Star):
             "未知": "unknown",
         }.get(compact)
 
-    async def _build_search_query(
+    @classmethod
+    def _is_image_placeholder(cls, text: str) -> bool:
+        raw = (text or "").strip()
+        if not raw:
+            return False
+        if _IMAGE_PLACEHOLDER_RE.fullmatch(raw):
+            return True
+        compact = re.sub(r"\s+", "", raw)
+        if not compact:
+            return False
+        stripped = _IMAGE_PLACEHOLDER_TOKEN_RE.sub("", compact)
+        return not stripped.strip()
+
+    @classmethod
+    def _sanitize_claim_text(cls, text: str) -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        if cls._is_image_placeholder(raw):
+            return ""
+        cleaned = _IMAGE_PLACEHOLDER_TOKEN_RE.sub(" ", raw)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if cls._is_image_placeholder(cleaned):
+            return ""
+        return cleaned
+
+    @classmethod
+    def _is_useless_search_query(cls, query: str) -> bool:
+        q = (query or "").strip()
+        if not q:
+            return True
+        if cls._is_image_placeholder(q):
+            return True
+        compact = re.sub(r"[\s\-_|｜]+", "", q).lower()
+        if not compact:
+            return True
+        if compact in {
+            "none",
+            "n/a",
+            "na",
+            "null",
+            "无",
+            "无搜索",
+            "不需要",
+            "不需要搜索",
+            "图片",
+            "截图",
+            "image",
+            "images",
+            "photo",
+            "如图",
+            "见图",
+        }:
+            return True
+        if len(compact) <= 1:
+            return True
+        return False
+
+    def _fallback_plan(
+        self,
+        *,
+        text: str,
+        images: list[str],
+        supplement: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Rule fallback when LLM planning fails or returns garbage."""
+        base = "\n".join(p for p in (text, supplement) if p).strip()
+        base = re.sub(r"\s+", " ", base).strip()
+        claim = base[:80] if base else ""
+        queries: list[str] = []
+        need_search = False
+        note = reason
+
+        if base and not self._is_useless_search_query(base):
+            need_search = True
+            queries = [base[:80]]
+        elif images and self.enable_vision:
+            # 有图无有效字：需要搜索，但把 query 留给规划失败后的空列表；
+            # 调用方若 enable_web_search 会记 note；终判仍带图。
+            need_search = True
+            note = (note + "；" if note else "") + (
+                "规划回退：仅有图片，终判将依赖视觉；无可靠搜索词则跳过联网"
+            )
+            # 尝试用极短通用描述不如不搜；保持 queries 空
+            queries = []
+        else:
+            need_search = False
+            if not claim and not images:
+                note = (note + "；" if note else "") + "无有效图文可核查"
+
+        return {
+            "claim": claim,
+            "queries": queries,
+            "need_search": need_search,
+            "note": note.strip("；"),
+            "fallback": True,
+        }
+
+    async def _plan_verification(
         self,
         provider,
         *,
         text: str,
         images: list[str],
         supplement: str,
-    ) -> str:
-        base = "\n".join(p for p in (text, supplement) if p).strip()
-        if base and len(base) <= 80:
-            return re.sub(r"\s+", " ", base)[:80]
+        source: str,
+    ) -> dict[str, Any]:
+        """Joint text+image plan: claim + whether/what to search."""
+        vision_urls = images[:3] if (images and self.enable_vision) else []
+        # 纯短有效文本且无图：可直接当 claim/query，省一次规划调用
+        if text and not supplement and not vision_urls and len(text) <= 80:
+            q = re.sub(r"\s+", " ", text).strip()[:80]
+            if not self._is_useless_search_query(q):
+                plan = {
+                    "claim": q,
+                    "queries": [q],
+                    "need_search": True,
+                    "note": "",
+                    "fallback": False,
+                }
+                logger.info(f"{LOG_PREFIX} 规划 | 短文本直通 claim={q!r}")
+                return plan
 
-        if base:
-            extracted = await self._llm_extract_claim(provider, base, images=images)
-            if extracted:
-                return extracted
-            compact = re.sub(r"\s+", " ", base).strip()
-            return compact[:80]
+        user_bits = [
+            f"来源：{source}",
+            f"文字：{text or '（无有效文字）'}",
+        ]
+        if supplement:
+            user_bits.append(f"用户补充：{supplement}")
+        if vision_urls:
+            user_bits.append(f"图片：已附带 {len(vision_urls)} 张，请阅读图中信息。")
+        elif images:
+            user_bits.append(f"图片：有 {len(images)} 张但当前未启用视觉。")
+        else:
+            user_bits.append("图片：无")
 
-        if images and self.enable_vision:
-            return await self._query_from_images(provider, images)
-        return ""
-
-    async def _llm_extract_claim(
-        self, provider, text: str, images: list[str] | None = None
-    ) -> str:
-        snippet = self._truncate(text, 1200)
         try:
             resp = await provider.text_chat(
-                prompt=(
-                    "从下列内容中提取最值得事实核查的一条核心主张，改写成可搜索的中文短句。"
-                    "只输出短句本身，不超过40字，不要解释。\n\n"
-                    f"{snippet}"
-                ),
-                image_urls=(images[:3] if (images and self.enable_vision) else []),
+                prompt="\n".join(user_bits),
+                image_urls=vision_urls,
+                system_prompt=self.plan_prompt,
             )
-            out = (resp.completion_text or "").strip().replace("\n", " ")
-            out = re.sub(r"\s+", " ", out).strip(" \"'`")
-            return out[:60]
+            raw = (resp.completion_text or "").strip()
+            logger.info(f"{LOG_PREFIX} 规划原始返回：{raw[:240]!r}")
+            parsed = self._parse_plan_response(raw)
+            if parsed is not None:
+                return parsed
+            logger.warning(f"{LOG_PREFIX} 规划结果无法解析，走规则回退")
+            return self._fallback_plan(
+                text=text,
+                images=images,
+                supplement=supplement,
+                reason="规划输出无法解析，已规则回退",
+            )
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"{LOG_PREFIX} 提取核查主张失败：{e}")
-            return ""
+            if vision_urls:
+                # 视觉通道不可用：剥图重试一次规划，再失败才走规则回退
+                logger.warning(f"{LOG_PREFIX} 规划带图调用失败({e})，剥图重试")
+                try:
+                    degrade_bits = [
+                        bit for bit in user_bits if not bit.startswith("图片：")
+                    ]
+                    degrade_bits.append(
+                        f"图片：有 {len(images)} 张但视觉通道不可用，本次未附带。"
+                    )
+                    resp = await provider.text_chat(
+                        prompt="\n".join(degrade_bits),
+                        image_urls=[],
+                        system_prompt=self.plan_prompt,
+                    )
+                    raw = (resp.completion_text or "").strip()
+                    logger.info(f"{LOG_PREFIX} 规划剥图重试返回：{raw[:240]!r}")
+                    parsed = self._parse_plan_response(raw)
+                    if parsed is not None:
+                        return parsed
+                except Exception as e2:  # noqa: BLE001
+                    logger.warning(f"{LOG_PREFIX} 规划剥图重试失败：{e2}")
+            logger.warning(f"{LOG_PREFIX} 规划调用失败，走规则回退：{e}")
+            return self._fallback_plan(
+                text=text,
+                images=images,
+                supplement=supplement,
+                reason=f"规划调用失败：{e}",
+            )
 
-    async def _query_from_images(self, provider, images: list[str]) -> str:
-        if not self.enable_vision:
-            return ""
-        try:
-            resp = await provider.text_chat(
-                prompt=(
-                    "请用一句话（30字以内）概括图片中最关键、最适合联网核查的事实主张，"
-                    "只输出该句子本身，不要解释。"
-                ),
-                image_urls=images[:3],
+    def _parse_plan_response(self, raw: str) -> dict[str, Any] | None:
+        if not raw:
+            return None
+
+        claim = ""
+        search_raw = ""
+        need_raw = ""
+        note = ""
+
+        # 行协议
+        for line in raw.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            m = re.match(
+                r"^(CLAIM|SEARCH|NEED_SEARCH|NOTE)\s*[:：\-]\s*(.*)$",
+                s,
+                flags=re.I,
             )
-            return (resp.completion_text or "").strip().replace("\n", " ")[:60]
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"{LOG_PREFIX} 从图片提取关键词失败：{e}")
-            return ""
+            if not m:
+                continue
+            key = m.group(1).upper()
+            val = m.group(2).strip()
+            if key == "CLAIM":
+                claim = val
+            elif key == "SEARCH":
+                search_raw = val
+            elif key == "NEED_SEARCH":
+                need_raw = val
+            elif key == "NOTE":
+                note = val
+
+        # 宽松 JSON
+        if not (claim or search_raw or need_raw):
+            try:
+                start = raw.find("{")
+                end = raw.rfind("}")
+                if start >= 0 and end > start:
+                    data = json.loads(raw[start : end + 1])
+                    if isinstance(data, dict):
+                        claim = str(
+                            data.get("claim") or data.get("CLAIM") or ""
+                        ).strip()
+                        sq = (
+                            data.get("search")
+                            or data.get("SEARCH")
+                            or data.get("queries")
+                        )
+                        if isinstance(sq, list):
+                            search_raw = " | ".join(str(x) for x in sq)
+                        else:
+                            search_raw = str(sq or "").strip()
+                        need_raw = str(
+                            data.get("need_search") or data.get("NEED_SEARCH") or ""
+                        ).strip()
+                        note = str(data.get("note") or data.get("NOTE") or "").strip()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 仍没有结构：若整段很短且像搜索词，当 claim
+        if not (claim or search_raw or need_raw):
+            compact = re.sub(r"\s+", " ", raw).strip()
+            if 2 <= len(compact) <= 60 and not self._is_useless_search_query(compact):
+                claim = compact[:80]
+                search_raw = compact[:80]
+                need_raw = "yes"
+            else:
+                return None
+
+        claim = re.sub(r"\s+", " ", claim).strip().strip(" \"'`")
+        if self._is_image_placeholder(claim) or claim.lower() in {
+            "none",
+            "n/a",
+            "无",
+            "空",
+        }:
+            claim = ""
+        claim = claim[:120]
+
+        need_search = self._parse_need_search(need_raw, search_raw)
+        queries = self._split_search_queries(search_raw)
+        if (
+            need_search
+            and not queries
+            and claim
+            and not self._is_useless_search_query(claim)
+        ):
+            queries = [claim[:80]]
+        if not need_search:
+            queries = []
+
+        return {
+            "claim": claim,
+            "queries": queries[: self.max_search_queries],
+            "need_search": need_search,
+            "note": re.sub(r"\s+", " ", note).strip()[:120],
+            "fallback": False,
+        }
+
+    @staticmethod
+    def _parse_need_search(need_raw: str, search_raw: str) -> bool:
+        n = (need_raw or "").strip().lower()
+        if n in {"yes", "y", "true", "1", "需要", "是", "要"}:
+            return True
+        if n in {"no", "n", "false", "0", "不需要", "否", "不"}:
+            return False
+        s = (search_raw or "").strip().lower()
+        if not s or s in {"none", "n/a", "na", "null", "无", "不需要"}:
+            return False
+        return True
+
+    def _split_search_queries(self, search_raw: str) -> list[str]:
+        raw = (search_raw or "").strip()
+        if not raw:
+            return []
+        low = raw.lower().strip()
+        if low in {"none", "n/a", "na", "null", "无", "不需要", "不需要搜索"}:
+            return []
+        parts = re.split(r"\s*[|｜]\s*|\n+", raw)
+        out: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            q = re.sub(r"\s+", " ", part).strip().strip(" \"'`")
+            q = q[:80]
+            if self._is_useless_search_query(q):
+                continue
+            key = q.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(q)
+            if len(out) >= self.max_search_queries:
+                break
+        return out
 
     async def _web_search(
         self, query: str, event: AstrMessageEvent | None = None
     ) -> str:
+        """搜索渠道适配层入口。
+
+        search_provider 指定渠道时只走该渠道；auto 时按框架配置的
+        websearch_provider 优先，其余渠道按固定顺序自动降级。
+        任一渠道失败/无 Key/空结果都不抛异常，返回 "" 让上层走兜底。
+        """
         query = (query or "").strip()
-        if not query:
+        if not query or self.search_provider == "none":
             return ""
+
+        provider = self.search_provider
+        if provider != "auto":
+            try:
+                return await self._search_with(provider, query, event)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"{LOG_PREFIX} {provider} 搜索失败：{e}")
+                return ""
+
+        last_err: Exception | None = None
+        for cand in self._auto_search_order():
+            try:
+                result = await self._search_with(cand, query, event)
+                if result:
+                    return result
+                logger.info(f"{LOG_PREFIX} {cand} 返回空结果，尝试下一渠道")
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                logger.warning(f"{LOG_PREFIX} {cand} 搜索失败，尝试下一渠道：{e}")
+        if last_err:
+            logger.warning(f"{LOG_PREFIX} 全部搜索渠道失败：{last_err}")
+        return ""
+
+    def _auto_search_order(self) -> list[str]:
+        """auto 优先级：框架配置的 websearch_provider 放首位，其余固定顺序兜底。"""
+        order: list[str] = []
+        try:
+            cfg = self.context.get_config(umo=None)
+            provider_settings = cfg.get("provider_settings", {}) or {}
+            framework_provider = (
+                str(provider_settings.get("websearch_provider", "") or "")
+                .strip()
+                .lower()
+            )
+            if framework_provider in SEARCH_FALLBACK_ORDER:
+                order.append(framework_provider)
+        except Exception:  # noqa: BLE001
+            pass  # 读框架配置失败按未配置处理，走默认降级顺序
+        for p in SEARCH_FALLBACK_ORDER:
+            if p not in order:
+                order.append(p)
+        return order
+
+    def _read_framework_keys(self, setting_name: str) -> list[str]:
+        """从框架 provider_settings 读取 Key 列表（websearch_tavily_key 等）。"""
+        try:
+            cfg = self.context.get_config(umo=None)
+            provider_settings = cfg.get("provider_settings", {}) or {}
+            raw = provider_settings.get(setting_name, [])
+        except Exception:  # noqa: BLE001
+            return []
+        if isinstance(raw, str):
+            raw = [raw] if raw.strip() else []
+        if not isinstance(raw, list):
+            return []
+        return [str(k).strip() for k in raw if str(k).strip()]
+
+    async def _search_with(
+        self, provider: str, query: str, event: AstrMessageEvent | None = None
+    ) -> str:
+        """按渠道分发：tavily 直连 / anysearch 工具或内联 / 其余走框架内置工具。"""
+        if provider == "anysearch":
+            return await self._anysearch_search(query, event)
+        if provider == "tavily":
+            return await self._tavily_search(query)
+        return await self._builtin_tool_search(provider, query, event)
+
+    async def _tavily_search(self, query: str) -> str:
+        """直连 Tavily /search：从框架配置读取 Key，round-robin + 失败自动换 Key。"""
+        keys = self._read_framework_keys("websearch_tavily_key")
+        if not keys:
+            logger.info(f"{LOG_PREFIX} 框架未配置 Tavily Key，跳过该渠道")
+            return ""
+
+        import aiohttp
+
+        payload = {"query": query, "max_results": 5, "search_depth": "basic"}
+        timeout = aiohttp.ClientTimeout(total=self.search_timeout)
+        last_err: Exception | None = None
+        for _ in range(len(keys)):
+            key = keys[self._tavily_key_idx % len(keys)]
+            self._tavily_key_idx += 1
+            try:
+                async with (
+                    aiohttp.ClientSession(timeout=timeout, trust_env=True) as session,
+                    session.post(
+                        "https://api.tavily.com/search",
+                        json=payload,
+                        headers={
+                            "Authorization": f"Bearer {key}",
+                            "Content-Type": "application/json",
+                        },
+                    ) as resp,
+                ):
+                    if resp.status == 200:
+                        data = await resp.json()
+                        items = data.get("results", []) or []
+                        if not items:
+                            return ""
+                        lines = []
+                        for item in items[:5]:
+                            title = str(item.get("title") or "无标题")
+                            url = str(item.get("url") or "")
+                            content = str(item.get("content") or "")
+                            lines.append(
+                                f"### {title}\n- **URL**: {url}\n- **内容**: {content[:500]}"
+                            )
+                        return "## Tavily 搜索结果\n" + "\n\n".join(lines)
+                    reason = (await resp.text())[:200]
+                    if resp.status in _RETRYABLE_HTTP_STATUSES:
+                        last_err = RuntimeError(f"HTTP {resp.status} {reason}")
+                        continue
+                    logger.warning(f"{LOG_PREFIX} Tavily HTTP {resp.status}: {reason}")
+                    return ""
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                continue
+        if last_err is not None:
+            logger.warning(f"{LOG_PREFIX} Tavily 全部 Key 失败：{last_err}")
+            raise last_err
+        return ""
+
+    async def _anysearch_search(
+        self, query: str, event: AstrMessageEvent | None = None
+    ) -> str:
+        """Anysearch 渠道：优先 anysearch_search 工具，否则内联 HTTP 直连。"""
         try:
             tool_manager = getattr(self.context, "get_llm_tool_manager", lambda: None)()
             tool = tool_manager.get_func("anysearch_search") if tool_manager else None
@@ -625,10 +1222,39 @@ class IsItTrue(Star):
             )
             return self._truncate(str(result or "").strip(), self.max_search_chars)
         except TimeoutError as e:
-            logger.warning(f"{LOG_PREFIX} 联网搜索超时，回退兜底：{e}")
+            logger.warning(f"{LOG_PREFIX} Anysearch 搜索超时：{e}")
             return ""
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"{LOG_PREFIX} 联网搜索异常，回退兜底：{e}")
+            logger.warning(f"{LOG_PREFIX} Anysearch 搜索异常：{e}")
+            return ""
+
+    async def _builtin_tool_search(
+        self, provider: str, query: str, event: AstrMessageEvent | None = None
+    ) -> str:
+        """调用框架内置 web_search_{provider} 工具（如 bocha/brave/firecrawl 等）。"""
+        tool_manager = getattr(self.context, "get_llm_tool_manager", lambda: None)()
+        tool = tool_manager.get_func(f"web_search_{provider}") if tool_manager else None
+        if (
+            tool is None
+            or not getattr(tool, "active", True)
+            or not hasattr(tool, "call")
+        ):
+            return ""
+        logger.info(f"{LOG_PREFIX} 使用框架内置工具 web_search_{provider} 搜索")
+        try:
+            from astrbot.core.astr_agent_context import AstrAgentContext
+
+            agent_ctx = AstrAgentContext(context=self.context, event=event)
+            result = await asyncio.wait_for(
+                tool.call(agent_ctx, query=query, max_results=5),
+                timeout=self.search_timeout + 10,
+            )
+            text = str(getattr(result, "result", result) or "").strip()
+            if not text or text.startswith("Error:"):
+                return ""
+            return self._truncate(text, self.max_search_chars)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"{LOG_PREFIX} 内置工具 web_search_{provider} 调用失败：{e}")
             return ""
 
     @staticmethod
@@ -639,7 +1265,9 @@ class IsItTrue(Star):
             candidates.extend(
                 [
                     data_path / "config" / "astrbot_plugin_anysearch_config.json",
-                    data_path / "plugin_configs" / "astrbot_plugin_anysearch_config.json",
+                    data_path
+                    / "plugin_configs"
+                    / "astrbot_plugin_anysearch_config.json",
                     data_path
                     / "plugin_configs"
                     / "astrbot_plugin_anysearch"
@@ -662,6 +1290,7 @@ class IsItTrue(Star):
                     f"{LOG_PREFIX} 读取 Anysearch 配置失败：{config_path} | {e}"
                 )
         return ""
+
     @staticmethod
     def _friendly_error(err_msg: str) -> str:
         msg = err_msg.lower()
@@ -786,9 +1415,11 @@ class IsItTrue(Star):
         )
         current_text = self._strip_triggers(current_text, strip_keyword)
 
-        forward_text, forward_images, forward_note = await self._extract_forward_from_chain(
-            event, chain
-        )
+        (
+            forward_text,
+            forward_images,
+            forward_note,
+        ) = await self._extract_forward_from_chain(event, chain)
         if forward_text or forward_images:
             return {
                 "source": "合并转发",
@@ -817,6 +1448,7 @@ class IsItTrue(Star):
                     getattr(comp, "message_str", "") or getattr(comp, "text", "") or ""
                 ).strip()
             if quoted_text or quoted_images:
+                # 保留原始 quoted_text 供上层 raw 对比；纯占位由 handle 再 sanitize
                 return {
                     "source": "引用消息",
                     "text": quoted_text,
@@ -832,6 +1464,7 @@ class IsItTrue(Star):
             "supplement": "",
             "image_note": "",
         }
+
     def _new_forward_budget(self) -> _ForwardBudget:
         return _ForwardBudget(
             max_depth=self.max_forward_depth,
