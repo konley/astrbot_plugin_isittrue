@@ -4,7 +4,7 @@
 
 群聊事实核查小工具。@机器人说出你想核实的事情，或**引用一条消息**（支持文本 / 图片 / 合并转发），AI 自动判断真假，返回 `✅ 真的喵` / `❌ 假的喵` / `⚠️ 布吉岛` + 中文解释。
 
-移植自 [@花火](https://github.com/yhArcadia) 的 `is-it-true.js`，无需额外 API Key，即装即用。
+移植自 [@渔火](https://github.com/yhArcadia) 的 `is-it-true.js`，无需额外 API Key，即装即用。
 
 ## 触发方式
 
